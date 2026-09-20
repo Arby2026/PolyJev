@@ -52,3 +52,25 @@ def calculate_features(
         "time_remaining_sec": window_end - observed_at_timestamp,
     }
 
+
+def calculate_p_simple(
+    proxy_start_price: float,
+    proxy_current_price: float,
+    realized_vol_15m: float,
+    time_remaining_sec: float,
+) -> float | None:
+    """Zero-drift baseline based only on the Binance proxy and minute volatility."""
+    remaining_minutes = time_remaining_sec / 60
+    if remaining_minutes <= 0:
+        return None
+    if proxy_start_price <= 0 or proxy_current_price <= 0:
+        raise RuntimeError("P_simple requires positive proxy prices")
+    if abs(realized_vol_15m) <= 1e-12:
+        if proxy_current_price > proxy_start_price:
+            return 1.0
+        if proxy_current_price < proxy_start_price:
+            return 0.0
+        return 0.5
+    distance = math.log(proxy_current_price / proxy_start_price)
+    z_score = distance / (realized_vol_15m * math.sqrt(remaining_minutes))
+    return 0.5 * (1 + math.erf(z_score / math.sqrt(2)))

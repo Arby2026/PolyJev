@@ -62,6 +62,27 @@ def map_outcome_tokens(outcomes: Any, token_ids: Any) -> dict[str, str]:
     return {"Up": mapping["up"], "Down": mapping["down"]}
 
 
+def parse_resolved_outcome(outcomes: Any, outcome_prices: Any) -> str | None:
+    parsed_outcomes = _parse_json_list(outcomes, "outcomes")
+    parsed_prices = _parse_json_list(outcome_prices, "outcomePrices")
+    if len(parsed_outcomes) != len(parsed_prices):
+        raise RuntimeError("Gamma malformed response: outcomes/prices length mismatch")
+    if len(parsed_outcomes) != 2:
+        raise RuntimeError("resolved market must contain exactly Up and Down")
+    try:
+        normalized = [str(outcome).strip().casefold() for outcome in parsed_outcomes]
+        prices = [float(price) for price in parsed_prices]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Gamma malformed response: invalid outcome price") from exc
+    if set(normalized) != {"up", "down"}:
+        raise RuntimeError("resolved market is missing Up/Down outcomes")
+    winners = [index for index, price in enumerate(prices) if price >= 0.99]
+    losers = [index for index, price in enumerate(prices) if price <= 0.01]
+    if len(winners) != 1 or len(losers) != 1 or winners[0] == losers[0]:
+        return None
+    return normalized[winners[0]].upper()
+
+
 def best_prices(book: dict[str, Any]) -> tuple[float | None, float | None]:
     bids = book.get("bids")
     asks = book.get("asks")

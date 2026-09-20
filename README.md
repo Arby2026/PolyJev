@@ -1,7 +1,8 @@
-# Jev × Polymarket — этап 1
+# Jev × Polymarket — этап 2
 
-Минимальный сборщик одного snapshot для текущего рынка `BTC Up or Down 15m`
-или `ETH Up or Down 15m`. Он использует только публичные REST API:
+Минимальный автономный сборщик dataset для рынков `BTC Up or Down 15m` и
+`ETH Up or Down 15m`. Ручной snapshot из этапа 1 сохранён. Проект использует
+только публичные REST API:
 
 - Gamma API — точный event по вычисленному slug;
 - CLOB API — реальные книги заявок outcome-токенов Up и Down;
@@ -23,7 +24,7 @@ python -m pip install -r requirements.txt
 
 Для macOS/Linux команда активации: `source .venv/bin/activate`.
 
-## Запуск
+## Ручной snapshot
 
 ```powershell
 python run.py snapshot --asset BTC
@@ -42,9 +43,37 @@ python run.py snapshot --asset BTC --window-start 1789910100
 считает features и сохраняет одну строку в `data/experiment.duckdb`, таблица
 `snapshots`.
 
-`return_1m`, `return_5m`, `realized_vol_5m` и `realized_vol_15m` хранятся как
+## Collector
+
+```powershell
+python run.py collect
+```
+
+Collector одним процессом опрашивает локальное UTC-время и сохраняет BTC/ETH
+snapshots около трёх checkpoints: `T-10`, `T-5` и `T-2`. Допустимое окно — до
+15 секунд после checkpoint; пропущенные checkpoints не восстанавливаются.
+Повторный запуск пропускает уже существующую пару `market_slug + checkpoint`.
+После закрытия рынка outcome `UP`/`DOWN` берётся только из однозначно
+разрешённых Gamma metadata и записывается во все snapshots рынка.
+
+Остановить collector можно через `Ctrl+C`.
+
+## Status
+
+```powershell
+python run.py status
+```
+
+Команда читает локальную DuckDB без сетевых запросов и показывает количество
+рынков, snapshots, checkpoints, resolved/unresolved markets и последний snapshot.
+
+`P_simple` — zero-drift probability baseline, рассчитанная по Binance proxy и
+realized volatility; она **не** является settlement probability source.
+
+`return_1m` и `return_5m` приближены по доступным 1-minute candles и не обещают
+sub-minute точность. Returns и `realized_vol_5m`/`realized_vol_15m` хранятся как
 доли (не проценты). Волатильность — population standard deviation минутных
-лог-доходностей, без annualization. `distance_from_start_bps` хранится в bps.
+лог-доходностей без annualization. `distance_from_start_bps` хранится в bps.
 
 ## Тесты
 
@@ -52,12 +81,11 @@ python run.py snapshot --asset BTC --window-start 1789910100
 python -m pytest -q
 ```
 
-Тесты покрывают округление окна, slug, mapping outcome → token, извлечение
-лучших цен без предположения о сортировке и расчёт features на synthetic data.
+Тесты покрывают логику этапов 1–2: окна и slug, mapping outcomes, лучшие цены,
+features, checkpoints, `P_simple`, duplicate detection и parsing resolution.
 
 ## Использованная официальная документация
 
 - [Discover Markets](https://docs.polymarket.com/market-data/discover-markets)
 - [Prices and Order Books](https://docs.polymarket.com/market-data/prices-order-books)
 - [Chainlink TWAP Prices](https://docs.polymarket.com/market-data/chainlink-twap)
-

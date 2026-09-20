@@ -12,10 +12,10 @@ __pycache__/
 data/*.duckdb
 data/*.duckdb.wal
 data/*.db
+data/collector_status.json
 
 .DS_Store
 Thumbs.db
 
 .idea/
 .vscode/
-
