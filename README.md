@@ -88,6 +88,15 @@ python run.py status
 Команда читает локальную DuckDB без сетевых запросов и показывает количество
 рынков, snapshots, checkpoints, resolved/unresolved markets и последний snapshot.
 
+## Stage 4 analysis
+
+```powershell
+python analyze.py
+```
+
+Stage 4 compares Market, `P_simple`, Jev Blind and Jev Meta using resolved
+checkpoint observations.
+
 `P_simple` — zero-drift probability baseline, рассчитанная по Binance proxy и
 realized volatility; она **не** является settlement probability source.
 
