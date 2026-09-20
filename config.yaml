@@ -1,0 +1,7 @@
+gamma_base_url: https://gamma-api.polymarket.com
+clob_base_url: https://clob.polymarket.com
+binance_base_url: https://api.binance.com
+database_path: data/experiment.duckdb
+http_timeout_sec: 10
+http_retries: 2
+
