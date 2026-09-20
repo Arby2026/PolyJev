@@ -187,3 +187,40 @@ async def call_jev_choice_async(
     result = parse_choice_response(response, question_name, tuple(criteria))
     result["latency_ms"] = (time.perf_counter() - started) * 1000
     return result
+
+
+async def call_jev_nouls_async(
+    client: OpenRouter,
+    model: str,
+    state: dict[str, Any],
+    questions: Mapping[str, str],
+) -> dict[str, Any]:
+    """Run one async Decisions request containing multiple Noul questions."""
+    started = time.perf_counter()
+    try:
+        response = await client.alpha.decisions.create_async(
+            model=model,
+            state=state,
+            questions={
+                name: {"type": "noul", "instructions": instructions}
+                for name, instructions in questions.items()
+            },
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Jev request failed: {concise_error(exc)}") from exc
+    probabilities: dict[str, float] = {}
+    try:
+        answers = response.answers
+        for name in questions:
+            answer = answers[name]
+            value = answer.get("noul") if isinstance(answer, Mapping) else answer.noul
+            probabilities[name] = validate_probability(value)
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise RuntimeError("Jev response is missing a requested Noul") from exc
+    usage = getattr(response, "usage", None)
+    return {
+        "probabilities": probabilities,
+        "model": getattr(response, "model", None),
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "latency_ms": (time.perf_counter() - started) * 1000,
+    }

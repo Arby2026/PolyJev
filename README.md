@@ -119,6 +119,27 @@ target position. Комиссии читаются из текущего рын�
 покупает по asks и продаёт по bids, а settlement платит 1/0 без taker fee.
 Реальные ордера и денежные средства не используются.
 
+## Forecast Experiment
+
+Отдельный realtime-эксперимент не торгует и не управляет позициями. Он строит
+position-independent Jev forecasts по live Polymarket CLOB и Chainlink raw +
+TWAP60 из Polymarket RTDS. Прогнозы на 15/30/60/120 секунд получают точные
+net-profit labels по будущим executable bids с учётом asks и taker fees;
+отдельно оценивается terminal resolution probability и fee-adjusted break-even.
+Лимит расходов Jev по умолчанию — `$0.15` на одну полную рыночную сессию.
+
+```powershell
+python forecast_experiment.py --asset BTC --max-jev-cost 0.15
+```
+
+Программа сама подписывается на Chainlink до следующего 15-минутного окна,
+проводит один полный market, получает resolution и печатает report. Повторный
+отчёт по сохранённой сессии:
+
+```powershell
+python forecast_report.py data/forecast_btc_<window_start>.jsonl
+```
+
 `P_simple` — zero-drift probability baseline, рассчитанная по Binance proxy и
 realized volatility; она **не** является settlement probability source.
 
