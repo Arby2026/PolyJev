@@ -13,6 +13,7 @@ data/*.duckdb
 data/*.duckdb.wal
 data/*.db
 data/collector_status.json
+data/live_*.jsonl
 
 .DS_Store
 Thumbs.db

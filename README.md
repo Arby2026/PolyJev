@@ -97,6 +97,28 @@ python analyze.py
 Stage 4 compares Market, `P_simple`, Jev Blind and Jev Meta using resolved
 checkpoint observations.
 
+## Realtime Jev Polymarket Paper Trader
+
+Задайте `OPENROUTER_API_KEY` в environment и запустите trader для текущего
+15-минутного рынка:
+
+```powershell
+python live_trader.py --asset BTC
+```
+
+Дополнительные варианты:
+
+```powershell
+python live_trader.py --asset ETH
+python live_trader.py --asset BTC --notional 10
+```
+
+Trader использует только Polymarket state из публичного realtime WebSocket,
+держит не более одного Jev inference в полёте и трактует `UP`/`DOWN`/`FLAT` как
+target position. Комиссии читаются из текущего рынка; paper taker execution
+покупает по asks и продаёт по bids, а settlement платит 1/0 без taker fee.
+Реальные ордера и денежные средства не используются.
+
 `P_simple` — zero-drift probability baseline, рассчитанная по Binance proxy и
 realized volatility; она **не** является settlement probability source.
 

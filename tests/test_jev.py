@@ -3,7 +3,13 @@ from types import SimpleNamespace
 import duckdb
 import pytest
 
-from jev import build_blind_state, build_meta_state, call_jev, validate_probability
+from jev import (
+    build_blind_state,
+    build_meta_state,
+    call_jev,
+    parse_choice_response,
+    validate_probability,
+)
 from run import _require_jev_api_key
 from storage import initialize_database, update_jev_results
 
@@ -127,6 +133,26 @@ def test_malformed_or_missing_resolves_up_raises_runtime_error(answers):
     response = SimpleNamespace(answers=answers, model=None, usage=None)
     with pytest.raises(RuntimeError, match="missing resolves_up Noul"):
         call_jev(FakeClient(response), "~typesafe/jev-latest", {}, "Decide")
+
+
+@pytest.mark.parametrize("choice", ["UP", "DOWN", "FLAT"])
+def test_target_choice_parsing(choice):
+    response = SimpleNamespace(
+        answers={
+            "target_position": SimpleNamespace(
+                choice=choice,
+                probabilities={"UP": 0.6, "DOWN": 0.2, "FLAT": 0.2},
+            )
+        },
+        model="typesafe/jev-1.13",
+        usage=SimpleNamespace(input_tokens=77),
+    )
+    result = parse_choice_response(
+        response, "target_position", ("UP", "DOWN", "FLAT")
+    )
+    assert result["choice"] == choice
+    assert result["probabilities"] == {"UP": 0.6, "DOWN": 0.2, "FLAT": 0.2}
+    assert result["input_tokens"] == 77
 
 
 def test_schema_upgrade_and_jev_update(tmp_path):

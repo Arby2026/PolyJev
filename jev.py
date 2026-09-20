@@ -25,6 +25,16 @@ META_INSTRUCTIONS = (
 )
 
 
+def concise_error(exc: Exception, limit: int = 300) -> str:
+    """Return one safe, bounded line for terminal and runtime error reporting."""
+    message = " ".join(str(exc).split())
+    if not message:
+        message = exc.__class__.__name__
+    if len(message) > limit:
+        return f"{message[: limit - 3]}..."
+    return message
+
+
 def build_blind_state(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "asset": snapshot["asset"],
@@ -101,7 +111,7 @@ def call_jev(
             },
         )
     except Exception as exc:
-        raise RuntimeError(f"Jev request failed: {exc}") from exc
+        raise RuntimeError(f"Jev request failed: {concise_error(exc)}") from exc
     latency_ms = (time.perf_counter() - started) * 1000
     try:
         answers = response.answers
@@ -117,3 +127,63 @@ def call_jev(
         "input_tokens": getattr(usage, "input_tokens", None),
         "latency_ms": latency_ms,
     }
+
+
+def parse_choice_response(
+    response: Any,
+    question_name: str,
+    choices: tuple[str, ...],
+) -> dict[str, Any]:
+    try:
+        answers = response.answers
+        answer = answers[question_name]
+        choice = answer.get("choice") if isinstance(answer, Mapping) else answer.choice
+        probabilities = (
+            answer.get("probabilities")
+            if isinstance(answer, Mapping)
+            else answer.probabilities
+        )
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Jev response is missing {question_name} Choice") from exc
+    if choice not in choices or not isinstance(probabilities, Mapping):
+        raise RuntimeError(f"Jev response has malformed {question_name} Choice")
+    parsed: dict[str, float] = {}
+    for name in choices:
+        if name not in probabilities:
+            raise RuntimeError(f"Jev response has malformed {question_name} probabilities")
+        parsed[name] = validate_probability(probabilities[name])
+    usage = getattr(response, "usage", None)
+    return {
+        "choice": choice,
+        "probabilities": parsed,
+        "model": getattr(response, "model", None),
+        "input_tokens": getattr(usage, "input_tokens", None),
+    }
+
+
+async def call_jev_choice_async(
+    client: OpenRouter,
+    model: str,
+    state: dict[str, Any],
+    instructions: str,
+    criteria: dict[str, str],
+    question_name: str = "target_position",
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        response = await client.alpha.decisions.create_async(
+            model=model,
+            state=state,
+            questions={
+                question_name: {
+                    "type": "choice",
+                    "instructions": instructions,
+                    "criteria": criteria,
+                }
+            },
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Jev request failed: {concise_error(exc)}") from exc
+    result = parse_choice_response(response, question_name, tuple(criteria))
+    result["latency_ms"] = (time.perf_counter() - started) * 1000
+    return result
