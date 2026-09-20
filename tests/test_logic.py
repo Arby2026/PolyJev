@@ -129,6 +129,13 @@ def test_duplicate_detection(tmp_path):
         "p_simple": 0.75,
         "outcome": None,
         "resolved_at": None,
+        "p_jev_blind": None,
+        "p_jev_meta": None,
+        "jev_model": None,
+        "jev_blind_latency_ms": None,
+        "jev_meta_latency_ms": None,
+        "jev_blind_input_tokens": None,
+        "jev_meta_input_tokens": None,
     }
     assert not snapshot_exists(database, snapshot["market_slug"], "T-5")
     save_snapshot(database, snapshot)

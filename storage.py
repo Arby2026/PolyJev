@@ -17,6 +17,8 @@ COLUMNS = [
     "proxy_current_price", "distance_from_start_bps", "return_1m", "return_5m",
     "realized_vol_5m", "realized_vol_15m", "time_remaining_sec", "raw_market_json",
     "checkpoint", "p_simple", "outcome", "resolved_at",
+    "p_jev_blind", "p_jev_meta", "jev_model", "jev_blind_latency_ms",
+    "jev_meta_latency_ms", "jev_blind_input_tokens", "jev_meta_input_tokens",
 ]
 
 
@@ -54,7 +56,14 @@ CREATE TABLE IF NOT EXISTS snapshots (
     checkpoint VARCHAR,
     p_simple DOUBLE,
     outcome VARCHAR,
-    resolved_at TIMESTAMPTZ
+    resolved_at TIMESTAMPTZ,
+    p_jev_blind DOUBLE,
+    p_jev_meta DOUBLE,
+    jev_model VARCHAR,
+    jev_blind_latency_ms DOUBLE,
+    jev_meta_latency_ms DOUBLE,
+    jev_blind_input_tokens BIGINT,
+    jev_meta_input_tokens BIGINT
 )
 """
 
@@ -64,6 +73,13 @@ UPGRADE_COLUMNS = {
     "p_simple": "DOUBLE",
     "outcome": "VARCHAR",
     "resolved_at": "TIMESTAMPTZ",
+    "p_jev_blind": "DOUBLE",
+    "p_jev_meta": "DOUBLE",
+    "jev_model": "VARCHAR",
+    "jev_blind_latency_ms": "DOUBLE",
+    "jev_meta_latency_ms": "DOUBLE",
+    "jev_blind_input_tokens": "BIGINT",
+    "jev_meta_input_tokens": "BIGINT",
 }
 
 
@@ -137,6 +153,45 @@ def set_market_outcome(
         )
 
 
+def update_jev_results(
+    database_path: str,
+    snapshot_id: str,
+    p_jev_blind: float,
+    p_jev_meta: float,
+    jev_model: str | None,
+    jev_blind_latency_ms: float,
+    jev_meta_latency_ms: float,
+    jev_blind_input_tokens: int | None,
+    jev_meta_input_tokens: int | None,
+) -> None:
+    initialize_database(database_path)
+    with duckdb.connect(database_path) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM snapshots WHERE snapshot_id = ?", [snapshot_id]
+        ).fetchone()
+        if exists is None:
+            raise RuntimeError(f"snapshot not found for Jev update: {snapshot_id}")
+        connection.execute(
+            """
+            UPDATE snapshots SET
+                p_jev_blind = ?, p_jev_meta = ?, jev_model = ?,
+                jev_blind_latency_ms = ?, jev_meta_latency_ms = ?,
+                jev_blind_input_tokens = ?, jev_meta_input_tokens = ?
+            WHERE snapshot_id = ?
+            """,
+            [
+                p_jev_blind,
+                p_jev_meta,
+                jev_model,
+                jev_blind_latency_ms,
+                jev_meta_latency_ms,
+                jev_blind_input_tokens,
+                jev_meta_input_tokens,
+                snapshot_id,
+            ],
+        )
+
+
 def status_summary(database_path: str) -> dict[str, Any] | None:
     path = Path(database_path)
     if not path.exists():
@@ -156,7 +211,15 @@ def status_summary(database_path: str) -> dict[str, Any] | None:
                 count(*) FILTER (WHERE checkpoint = 'T-10'),
                 count(*) FILTER (WHERE checkpoint = 'T-5'),
                 count(*) FILTER (WHERE checkpoint = 'T-2'),
-                count(DISTINCT CASE WHEN outcome IS NULL THEN market_slug END)
+                count(DISTINCT CASE WHEN outcome IS NULL THEN market_slug END),
+                count(*) FILTER (
+                    WHERE checkpoint IS NOT NULL
+                      AND p_jev_blind IS NOT NULL AND p_jev_meta IS NOT NULL
+                ),
+                count(*) FILTER (
+                    WHERE checkpoint IS NOT NULL
+                      AND (p_jev_blind IS NULL OR p_jev_meta IS NULL)
+                )
             FROM snapshots
             """
         ).fetchone()
@@ -177,5 +240,7 @@ def status_summary(database_path: str) -> dict[str, Any] | None:
         "t5": counts[5],
         "t2": counts[6],
         "unresolved": counts[7],
+        "jev_complete": counts[8],
+        "jev_missing": counts[9],
         "last": last,
     }

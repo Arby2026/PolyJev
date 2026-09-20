@@ -1,0 +1,110 @@
+"""Minimal TypeSafe Jev integration for snapshot probability enrichment."""
+
+from __future__ import annotations
+
+import math
+import time
+from typing import Any
+
+from typesafe_sdk import Noul, RetryPolicy, TypeSafeClient
+
+
+PROXY_NOTICE = (
+    "Binance Spot data is a predictive proxy only. "
+    "The contract resolves using the Chainlink source described in the rules."
+)
+BLIND_INSTRUCTIONS = (
+    "Based only on the provided state, will this Polymarket contract resolve UP "
+    "according to its stated resolution rules?"
+)
+META_INSTRUCTIONS = (
+    "Based on all provided information, will this Polymarket contract resolve UP "
+    "according to its stated resolution rules?"
+)
+
+
+def build_blind_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "asset": snapshot["asset"],
+        "resolution_rules": snapshot["rules"],
+        "resolution_source": snapshot["resolution_source"],
+        "time_remaining_sec": snapshot["time_remaining_sec"],
+        "proxy_start_price": snapshot["proxy_start_price"],
+        "proxy_current_price": snapshot["proxy_current_price"],
+        "distance_from_start_bps": snapshot["distance_from_start_bps"],
+        "return_1m": snapshot["return_1m"],
+        "return_5m": snapshot["return_5m"],
+        "realized_vol_5m": snapshot["realized_vol_5m"],
+        "realized_vol_15m": snapshot["realized_vol_15m"],
+        "proxy_notice": PROXY_NOTICE,
+    }
+
+
+def build_meta_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+    state = build_blind_state(snapshot)
+    state.update(
+        {
+            "p_simple": snapshot["p_simple"],
+            "p_simple_description": (
+                "Zero-drift probability baseline based on the Binance proxy."
+            ),
+            "p_market": snapshot["p_market"],
+            "p_market_description": "Polymarket UP midpoint.",
+            "up_best_bid": snapshot["up_best_bid"],
+            "up_best_ask": snapshot["up_best_ask"],
+            "down_best_bid": snapshot["down_best_bid"],
+            "down_best_ask": snapshot["down_best_ask"],
+            "quote_description": (
+                "Current executable market quotes, not final settlement probabilities."
+            ),
+        }
+    )
+    return state
+
+
+def validate_probability(value: Any) -> float:
+    try:
+        probability = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Jev returned a non-numeric probability") from exc
+    if not math.isfinite(probability) or not 0 <= probability <= 1:
+        raise RuntimeError("Jev probability must be between 0 and 1")
+    return probability
+
+
+def create_jev_client(model: str, timeout_sec: float = 8.0) -> TypeSafeClient:
+    return TypeSafeClient(
+        model=model,
+        timeout=timeout_sec,
+        retry=RetryPolicy(
+            max_retries=1,
+            backoff_initial=0.2,
+            backoff_max=0.5,
+            timeout=timeout_sec,
+        ),
+    )
+
+
+def call_jev(
+    client: TypeSafeClient, state: dict[str, Any], instructions: str
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        response = client.system_one(
+            state=state,
+            questions={"resolves_up": Noul(instructions=instructions)},
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Jev request failed: {exc}") from exc
+    latency_ms = (time.perf_counter() - started) * 1000
+    try:
+        probability = validate_probability(response.nouls["resolves_up"].noul)
+    except (AttributeError, KeyError) as exc:
+        raise RuntimeError("Jev response is missing resolves_up Noul") from exc
+    usage = getattr(response, "usage", None)
+    return {
+        "probability": probability,
+        "model": getattr(response, "model", None),
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "latency_ms": latency_ms,
+    }

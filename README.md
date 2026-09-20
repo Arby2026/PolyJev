@@ -1,4 +1,4 @@
-# Jev × Polymarket — этап 2
+# Jev × Polymarket — этап 3
 
 Минимальный автономный сборщик dataset для рынков `BTC Up or Down 15m` и
 `ETH Up or Down 15m`. Ручной snapshot из этапа 1 сохранён. Проект использует
@@ -24,6 +24,15 @@ python -m pip install -r requirements.txt
 
 Для macOS/Linux команда активации: `source .venv/bin/activate`.
 
+Официальный TypeSafe SDK устанавливается из `requirements.txt`. Для режимов с
+Jev ключ передаётся только через environment:
+
+```powershell
+$env:TYPESAFE_API_KEY="..."
+```
+
+Проект не читает `.env` и не сохраняет ключ в конфиге, коде или DuckDB.
+
 ## Ручной snapshot
 
 ```powershell
@@ -38,6 +47,12 @@ timestamp его начала (обязательно кратный 900):
 python run.py snapshot --asset BTC --window-start 1789910100
 ```
 
+Опциональное Jev enrichment выполняется только после сохранения base snapshot:
+
+```powershell
+python run.py snapshot --asset BTC --with-jev
+```
+
 Команда вычисляет slug без широкого поиска, проверяет asset и точные границы
 окна из Gamma, сопоставляет `outcomes` с `clobTokenIds`, читает обе книги,
 считает features и сохраняет одну строку в `data/experiment.duckdb`, таблица
@@ -47,6 +62,12 @@ python run.py snapshot --asset BTC --window-start 1789910100
 
 ```powershell
 python run.py collect
+```
+
+Collector с Jev enrichment:
+
+```powershell
+python run.py collect --with-jev
 ```
 
 Collector одним процессом опрашивает локальное UTC-время и сохраняет BTC/ETH
@@ -70,6 +91,11 @@ python run.py status
 `P_simple` — zero-drift probability baseline, рассчитанная по Binance proxy и
 realized volatility; она **не** является settlement probability source.
 
+`P_jev_blind` строится без Polymarket prices, quotes и `P_simple`.
+`P_jev_meta` видит тот же underlying state, а также `P_simple`, Polymarket UP
+midpoint и текущие UP/DOWN bid/ask. Оба значения — отдельные Noul-вызовы
+официального TypeSafe SDK.
+
 `return_1m` и `return_5m` приближены по доступным 1-minute candles и не обещают
 sub-minute точность. Returns и `realized_vol_5m`/`realized_vol_15m` хранятся как
 доли (не проценты). Волатильность — population standard deviation минутных
@@ -82,7 +108,8 @@ python -m pytest -q
 ```
 
 Тесты покрывают логику этапов 1–2: окна и slug, mapping outcomes, лучшие цены,
-features, checkpoints, `P_simple`, duplicate detection и parsing resolution.
+features, checkpoints, `P_simple`, duplicate detection, parsing resolution,
+изоляцию Blind/Meta state и обновление Jev-полей в DuckDB.
 
 ## Использованная официальная документация
 

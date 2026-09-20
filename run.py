@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import uuid
@@ -17,6 +18,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from features import calculate_features, calculate_p_simple
+from jev import (
+    BLIND_INSTRUCTIONS,
+    META_INSTRUCTIONS,
+    build_blind_state,
+    build_meta_state,
+    call_jev,
+    create_jev_client,
+)
 from market_data import fetch_binance_data
 from polymarket import (
     best_prices,
@@ -33,6 +42,7 @@ from storage import (
     snapshot_exists,
     status_summary,
     unresolved_markets,
+    update_jev_results,
 )
 
 
@@ -112,6 +122,13 @@ def print_summary(snapshot: dict[str, Any]) -> None:
     print(f"return_5m: {snapshot['return_5m']:+.6%}")
     print(f"realized_vol_5m: {snapshot['realized_vol_5m']:.6%}")
     print(f"realized_vol_15m: {snapshot['realized_vol_15m']:.6%}")
+    if snapshot["p_jev_blind"] is not None and snapshot["p_jev_meta"] is not None:
+        print("\nJev:")
+        print(f"Blind P(UP): {snapshot['p_jev_blind']:.4f}")
+        print(f"Meta  P(UP): {snapshot['p_jev_meta']:.4f}")
+        print(f"Model: {snapshot['jev_model']}")
+        print(f"Blind latency: {snapshot['jev_blind_latency_ms']:.1f} ms")
+        print(f"Meta latency: {snapshot['jev_meta_latency_ms']:.1f} ms")
     print(f"\nsaved snapshot: {snapshot['snapshot_id']}")
     print(f"database: {snapshot['database_path']}")
 
@@ -220,12 +237,57 @@ def collect_snapshot(
         "p_simple": p_simple,
         "outcome": None,
         "resolved_at": None,
+        "p_jev_blind": None,
+        "p_jev_meta": None,
+        "jev_model": None,
+        "jev_blind_latency_ms": None,
+        "jev_meta_latency_ms": None,
+        "jev_blind_input_tokens": None,
+        "jev_meta_input_tokens": None,
     }
     if not snapshot["market_id"] or not snapshot["condition_id"]:
         raise RuntimeError("Gamma malformed response: missing market id or condition id")
     save_snapshot(database_path, snapshot)
     snapshot["database_path"] = database_path
     return snapshot
+
+
+def _require_jev_api_key() -> None:
+    if not os.environ.get("TYPESAFE_API_KEY", "").strip():
+        raise RuntimeError("TYPESAFE_API_KEY is not set")
+
+
+def _enrich_snapshot_with_jev(
+    client: Any, snapshot: dict[str, Any], config: dict[str, Any]
+) -> None:
+    blind = call_jev(client, build_blind_state(snapshot), BLIND_INSTRUCTIONS)
+    meta = call_jev(client, build_meta_state(snapshot), META_INSTRUCTIONS)
+    model = meta["model"] or blind["model"] or str(config["jev_model"])
+    try:
+        update_jev_results(
+            str(config["database_path"]),
+            snapshot["snapshot_id"],
+            blind["probability"],
+            meta["probability"],
+            model,
+            blind["latency_ms"],
+            meta["latency_ms"],
+            blind["input_tokens"],
+            meta["input_tokens"],
+        )
+    except Exception as exc:
+        raise RuntimeError(f"failed to save Jev results: {exc}") from exc
+    snapshot.update(
+        {
+            "p_jev_blind": blind["probability"],
+            "p_jev_meta": meta["probability"],
+            "jev_model": model,
+            "jev_blind_latency_ms": blind["latency_ms"],
+            "jev_meta_latency_ms": meta["latency_ms"],
+            "jev_blind_input_tokens": blind["input_tokens"],
+            "jev_meta_input_tokens": meta["input_tokens"],
+        }
+    )
 
 
 def _collector_status_path(database_path: str) -> Path:
@@ -294,11 +356,15 @@ def _resolve_finished_markets(config: dict[str, Any]) -> tuple[list[tuple[str, s
     return resolved, errors
 
 
-def run_collector() -> int:
+def run_collector(with_jev: bool = False) -> int:
     config = load_config()
     database_path = str(config["database_path"])
     initialize_database(database_path)
     _write_last_error(database_path, None)
+    jev_client = None
+    if with_jev:
+        _require_jev_api_key()
+        jev_client = create_jev_client(str(config["jev_model"]))
     print("PolyJev collector started")
     print("assets: BTC, ETH")
     print("checkpoints: T-10, T-5, T-2")
@@ -312,6 +378,7 @@ def run_collector() -> int:
             for checkpoint, target_sec in CHECKPOINTS.items():
                 if not checkpoint_due(time_remaining, target_sec):
                     continue
+                captured_snapshots: list[dict[str, Any]] = []
                 for asset in ("BTC", "ETH"):
                     slug = market_slug(asset, window_start)
                     if snapshot_exists(database_path, slug, checkpoint):
@@ -319,6 +386,7 @@ def run_collector() -> int:
                     try:
                         snapshot = collect_snapshot(asset, window_start, checkpoint)
                         if snapshot is not None:
+                            captured_snapshots.append(snapshot)
                             print(
                                 f"[{asset}] {checkpoint} saved {snapshot['market_slug']} "
                                 f"({snapshot['time_remaining_sec']:.1f}s remaining)"
@@ -327,6 +395,21 @@ def run_collector() -> int:
                         message = f"[{asset}] {checkpoint} error: {exc}"
                         print(message, file=sys.stderr)
                         _write_last_error(database_path, message)
+                if jev_client is not None:
+                    for snapshot in captured_snapshots:
+                        try:
+                            _enrich_snapshot_with_jev(jev_client, snapshot, config)
+                            print(
+                                f"[{snapshot['asset']}] {checkpoint} Jev enriched "
+                                f"(blind={snapshot['p_jev_blind']:.4f}, "
+                                f"meta={snapshot['p_jev_meta']:.4f})"
+                            )
+                        except RuntimeError as exc:
+                            message = (
+                                f"[{snapshot['asset']}] {checkpoint} Jev error: {exc}"
+                            )
+                            print(message, file=sys.stderr)
+                            _write_last_error(database_path, message)
 
             if loop_time - last_resolution_check >= RESOLUTION_INTERVAL_SEC:
                 resolved, errors = _resolve_finished_markets(config)
@@ -340,6 +423,9 @@ def run_collector() -> int:
     except KeyboardInterrupt:
         print("PolyJev collector stopped")
         return 0
+    finally:
+        if jev_client is not None:
+            jev_client.close()
 
 
 def print_status() -> None:
@@ -362,6 +448,8 @@ def print_status() -> None:
     print(f"T-2: {summary['t2']}")
     print()
     print(f"Unresolved: {summary['unresolved']}")
+    print(f"Jev complete snapshots: {summary['jev_complete']}")
+    print(f"Jev missing snapshots: {summary['jev_missing']}")
     observed_at, asset, slug, checkpoint, remaining, p_market, p_simple = summary["last"]
     print("\nLast snapshot:")
     print(f"{observed_at} | {asset} | {slug} | {checkpoint or 'manual'}")
@@ -378,7 +466,9 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot = subparsers.add_parser("snapshot", help="capture one market snapshot")
     snapshot.add_argument("--asset", required=True, choices=("BTC", "ETH"))
     snapshot.add_argument("--window-start", type=int)
-    subparsers.add_parser("collect", help="run the autonomous checkpoint collector")
+    snapshot.add_argument("--with-jev", action="store_true")
+    collect = subparsers.add_parser("collect", help="run the autonomous checkpoint collector")
+    collect.add_argument("--with-jev", action="store_true")
     subparsers.add_parser("status", help="show local dataset status")
     return parser
 
@@ -391,9 +481,14 @@ def main() -> int:
                 raise RuntimeError("window-start must be aligned to a 15-minute UTC boundary")
             snapshot = collect_snapshot(args.asset, args.window_start)
             if snapshot is not None:
+                if args.with_jev:
+                    _require_jev_api_key()
+                    config = load_config()
+                    with create_jev_client(str(config["jev_model"])) as client:
+                        _enrich_snapshot_with_jev(client, snapshot, config)
                 print_summary(snapshot)
         elif args.command == "collect":
-            return run_collector()
+            return run_collector(args.with_jev)
         elif args.command == "status":
             print_status()
         return 0
