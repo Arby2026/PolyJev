@@ -253,15 +253,16 @@ def collect_snapshot(
 
 
 def _require_jev_api_key() -> None:
-    if not os.environ.get("TYPESAFE_API_KEY", "").strip():
-        raise RuntimeError("TYPESAFE_API_KEY is not set")
+    if not os.environ.get("OPENROUTER_API_KEY", "").strip():
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
 
 
 def _enrich_snapshot_with_jev(
     client: Any, snapshot: dict[str, Any], config: dict[str, Any]
 ) -> None:
-    blind = call_jev(client, build_blind_state(snapshot), BLIND_INSTRUCTIONS)
-    meta = call_jev(client, build_meta_state(snapshot), META_INSTRUCTIONS)
+    model = str(config["jev_model"])
+    blind = call_jev(client, model, build_blind_state(snapshot), BLIND_INSTRUCTIONS)
+    meta = call_jev(client, model, build_meta_state(snapshot), META_INSTRUCTIONS)
     model = meta["model"] or blind["model"] or str(config["jev_model"])
     try:
         update_jev_results(
@@ -364,7 +365,7 @@ def run_collector(with_jev: bool = False) -> int:
     jev_client = None
     if with_jev:
         _require_jev_api_key()
-        jev_client = create_jev_client(str(config["jev_model"]))
+        jev_client = create_jev_client()
     print("PolyJev collector started")
     print("assets: BTC, ETH")
     print("checkpoints: T-10, T-5, T-2")
@@ -425,7 +426,7 @@ def run_collector(with_jev: bool = False) -> int:
         return 0
     finally:
         if jev_client is not None:
-            jev_client.close()
+            jev_client.__exit__(None, None, None)
 
 
 def print_status() -> None:
@@ -484,7 +485,7 @@ def main() -> int:
                 if args.with_jev:
                     _require_jev_api_key()
                     config = load_config()
-                    with create_jev_client(str(config["jev_model"])) as client:
+                    with create_jev_client() as client:
                         _enrich_snapshot_with_jev(client, snapshot, config)
                 print_summary(snapshot)
         elif args.command == "collect":

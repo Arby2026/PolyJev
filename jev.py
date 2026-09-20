@@ -1,12 +1,14 @@
-"""Minimal TypeSafe Jev integration for snapshot probability enrichment."""
+"""Minimal OpenRouter Jev integration for snapshot probability enrichment."""
 
 from __future__ import annotations
 
 import math
+import os
 import time
+from collections.abc import Mapping
 from typing import Any
 
-from typesafe_sdk import Noul, RetryPolicy, TypeSafeClient
+from openrouter import OpenRouter
 
 
 PROXY_NOTICE = (
@@ -72,34 +74,41 @@ def validate_probability(value: Any) -> float:
     return probability
 
 
-def create_jev_client(model: str, timeout_sec: float = 8.0) -> TypeSafeClient:
-    return TypeSafeClient(
-        model=model,
-        timeout=timeout_sec,
-        retry=RetryPolicy(
-            max_retries=1,
-            backoff_initial=0.2,
-            backoff_max=0.5,
-            timeout=timeout_sec,
-        ),
+def create_jev_client(timeout_sec: float = 9.0) -> OpenRouter:
+    return OpenRouter(
+        api_key=os.environ.get("OPENROUTER_API_KEY", "").strip(),
+        timeout_ms=int(timeout_sec * 1000),
+        retry_config=None,
     )
 
 
 def call_jev(
-    client: TypeSafeClient, state: dict[str, Any], instructions: str
+    client: OpenRouter,
+    model: str,
+    state: dict[str, Any],
+    instructions: str,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     try:
-        response = client.system_one(
+        response = client.alpha.decisions.create(
+            model=model,
             state=state,
-            questions={"resolves_up": Noul(instructions=instructions)},
+            questions={
+                "resolves_up": {
+                    "type": "noul",
+                    "instructions": instructions,
+                }
+            },
         )
     except Exception as exc:
         raise RuntimeError(f"Jev request failed: {exc}") from exc
     latency_ms = (time.perf_counter() - started) * 1000
     try:
-        probability = validate_probability(response.nouls["resolves_up"].noul)
-    except (AttributeError, KeyError) as exc:
+        answers = response.answers
+        answer = answers["resolves_up"]
+        value = answer.get("noul") if isinstance(answer, Mapping) else answer.noul
+        probability = validate_probability(value)
+    except (AttributeError, KeyError, TypeError) as exc:
         raise RuntimeError("Jev response is missing resolves_up Noul") from exc
     usage = getattr(response, "usage", None)
     return {

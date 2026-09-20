@@ -24,11 +24,11 @@ python -m pip install -r requirements.txt
 
 Для macOS/Linux команда активации: `source .venv/bin/activate`.
 
-Официальный TypeSafe SDK устанавливается из `requirements.txt`. Для режимов с
-Jev ключ передаётся только через environment:
+Официальный OpenRouter Python SDK устанавливается из `requirements.txt`. Для
+режимов с Jev ключ передаётся только через environment:
 
 ```powershell
-$env:TYPESAFE_API_KEY="..."
+$env:OPENROUTER_API_KEY="..."
 ```
 
 Проект не читает `.env` и не сохраняет ключ в конфиге, коде или DuckDB.
@@ -94,7 +94,8 @@ realized volatility; она **не** является settlement probability sou
 `P_jev_blind` строится без Polymarket prices, quotes и `P_simple`.
 `P_jev_meta` видит тот же underlying state, а также `P_simple`, Polymarket UP
 midpoint и текущие UP/DOWN bid/ask. Оба значения — отдельные Noul-вызовы
-официального TypeSafe SDK.
+нативного OpenRouter Decisions API через официальный Python SDK и модель
+`~typesafe/jev-latest`.
 
 `return_1m` и `return_5m` приближены по доступным 1-minute candles и не обещают
 sub-minute точность. Returns и `realized_vol_5m`/`realized_vol_15m` хранятся как
@@ -113,6 +114,10 @@ features, checkpoints, `P_simple`, duplicate detection, parsing resolution,
 
 ## Использованная официальная документация
 
+- [OpenRouter Python SDK](https://openrouter.ai/docs/client-sdks/python/overview)
+- [TypeSafe models on OpenRouter](https://openrouter.ai/typesafe)
+- [Jev Latest](https://openrouter.ai/~typesafe/jev-latest)
+- [Jev compiler](https://openrouter.ai/labs/jev/compile)
 - [Discover Markets](https://docs.polymarket.com/market-data/discover-markets)
 - [Prices and Order Books](https://docs.polymarket.com/market-data/prices-order-books)
 - [Chainlink TWAP Prices](https://docs.polymarket.com/market-data/chainlink-twap)

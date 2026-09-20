@@ -1,7 +1,10 @@
+from types import SimpleNamespace
+
 import duckdb
 import pytest
 
-from jev import build_blind_state, build_meta_state, validate_probability
+from jev import build_blind_state, build_meta_state, call_jev, validate_probability
+from run import _require_jev_api_key
 from storage import initialize_database, update_jev_results
 
 
@@ -25,6 +28,22 @@ SNAPSHOT = {
     "down_best_ask": 0.33,
     "outcome": None,
 }
+
+
+class FakeDecisions:
+    def __init__(self, response):
+        self.response = response
+        self.request = None
+
+    def create(self, **kwargs):
+        self.request = kwargs
+        return self.response
+
+
+class FakeClient:
+    def __init__(self, response):
+        self.decisions = FakeDecisions(response)
+        self.alpha = SimpleNamespace(decisions=self.decisions)
 
 
 def test_blind_state_excludes_polymarket_and_baseline_fields():
@@ -67,6 +86,47 @@ def test_probability_validation_accepts_closed_interval(value):
 def test_probability_validation_rejects_outside_interval(value):
     with pytest.raises(RuntimeError, match="between 0 and 1"):
         validate_probability(value)
+
+
+def test_missing_openrouter_key_is_understandable(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY is not set"):
+        _require_jev_api_key()
+
+
+def test_decisions_noul_answer_is_parsed():
+    response = SimpleNamespace(
+        answers={"resolves_up": SimpleNamespace(type="noul", noul=0.64)},
+        model="typesafe/jev-1.13",
+        usage=SimpleNamespace(input_tokens=123),
+    )
+    client = FakeClient(response)
+
+    result = call_jev(client, "~typesafe/jev-latest", {"asset": "BTC"}, "Decide")
+
+    assert result["probability"] == 0.64
+    assert result["model"] == "typesafe/jev-1.13"
+    assert result["input_tokens"] == 123
+    assert client.decisions.request == {
+        "model": "~typesafe/jev-latest",
+        "state": {"asset": "BTC"},
+        "questions": {
+            "resolves_up": {"type": "noul", "instructions": "Decide"}
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        {},
+        {"resolves_up": SimpleNamespace(type="noul")},
+    ],
+)
+def test_malformed_or_missing_resolves_up_raises_runtime_error(answers):
+    response = SimpleNamespace(answers=answers, model=None, usage=None)
+    with pytest.raises(RuntimeError, match="missing resolves_up Noul"):
+        call_jev(FakeClient(response), "~typesafe/jev-latest", {}, "Decide")
 
 
 def test_schema_upgrade_and_jev_update(tmp_path):

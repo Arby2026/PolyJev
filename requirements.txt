@@ -2,4 +2,4 @@ PyYAML==6.0.2
 requests==2.32.5
 pytest==8.4.2
 duckdb==1.4.3
-typesafe-sdk==0.7.0
+openrouter==1.2.8
