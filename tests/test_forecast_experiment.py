@@ -1,5 +1,8 @@
 import json
+import asyncio
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal as D
 
 import pytest
@@ -7,8 +10,10 @@ import pytest
 from chainlink_live import ChainlinkLiveState
 from forecast_experiment import (
     CostGuard,
+    ForecastExperiment,
     PendingLabel,
     build_compact_state,
+    build_enriched_state,
     build_questions,
     capture_realtime_state,
     classify_winner_loser_edges,
@@ -27,8 +32,9 @@ from forecast_experiment import (
     winner_relative_metrics,
 )
 from forecast_report import generate_report, load_records
+from forecast_features import RawVolatility, TradeFlow
 from live_market import LiveMarketState
-from live_trader import MarketInfo
+from live_trader import MarketInfo, JsonlWriter
 from paper_trader import FeeSchedule, Level, quote_buy
 
 
@@ -108,14 +114,14 @@ def test_exactly_one_jev_question_resolve_up():
     entries = hypothetical_entries(ready_clob(), ENABLED)
     questions = build_questions(31, entries)
     assert questions == {
-        "resolve_up": "Will this contract resolve UP under the stated Chainlink rule?"
+        "p_final_up": "Will this contract resolve UP under the stated Chainlink rule?"
     }
 
 
 def test_unexecutable_entry_omits_side_questions():
     entries = hypothetical_entries(ready_clob(size="1"), ENABLED)
     questions = build_questions(500, entries)
-    assert list(questions) == ["resolve_up"]
+    assert list(questions) == ["p_final_up"]
 
 
 def test_p_down_is_complement_of_p_up():
@@ -333,3 +339,111 @@ def test_token_cost_accumulator_and_budget_guard():
     assert guard.estimated_cost == cost
     assert guard.can_request is False
     assert guard.metrics()["input_tokens_total"] == 1000
+
+
+def test_enriched_meta_text_contains_input_features_and_fee_schedule():
+    clob = ready_clob()
+    flow = TradeFlow(market().slug, "up", "down")
+    state, features = build_enriched_state(
+        market(), chainlink_state(), clob, hypothetical_entries(clob, ENABLED),
+        flow, RawVolatility(), 558,
+    )
+    assert features["time_left_sec"] == 342
+    assert features["fees_bps"] == 700
+    text = state["meta"]
+    for value in ("Time left: 342s (62% elapsed)", "Fees: 7% taker", "Flow 60s:", "Wall:", "Chainlink vol 60s:", "depth UP/DOWN", "bps)"):
+        assert value in text
+    free = replace(market(), fee_schedule=FeeSchedule(False))
+    _, features = build_enriched_state(free, chainlink_state(), clob, hypothetical_entries(clob, free.fee_schedule), flow, RawVolatility(), 558)
+    assert features["fees_bps"] == 0
+
+
+def experiment_session(monkeypatch, tmp_path, up_bid="0.49", up_ask="0.50", budget="0.05"):
+    monkeypatch.setattr("forecast_experiment.create_jev_client", lambda: object())
+    session = ForecastExperiment("BTC", D(budget))
+    session.market = market()
+    session.chainlink = chainlink_state()
+    session.flow = TradeFlow(session.market.slug, "up", "down")
+    session.clob = ready_clob(up_ask=up_ask)
+    session.clob.apply_event({"event_type": "book", "asset_id": "up", "bids": [{"price": up_bid, "size": "100"}], "asks": [{"price": up_ask, "size": "100"}]})
+    session.log = JsonlWriter(tmp_path / "v3.jsonl")
+    monkeypatch.setattr("forecast_experiment.time.time", lambda: 100.0)
+    return session
+
+
+@pytest.mark.parametrize("bid,ask,budget,reason", [
+    ("0.01", "0.02", "0.05", "mid_below_0.10"),
+    ("0.95", "0.96", "0.05", "mid_above_0.90"),
+    ("0.49", "0.50", "0", "budget_exhausted"),
+])
+def test_skip_does_not_call_jev_but_logs_all_features(monkeypatch, tmp_path, bid, ask, budget, reason):
+    session = experiment_session(monkeypatch, tmp_path, bid, ask, budget)
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Skipped candidate reached Jev")
+    monkeypatch.setattr("forecast_experiment.call_jev_nouls_async", forbidden)
+    payload = {"questions": build_questions()}
+    async def run():
+        result = await session._decide(payload)
+        now = datetime.now(timezone.utc)
+        await session._on_forecast(payload, result, now, now)
+    asyncio.run(run())
+    record = load_records(session.log.path)[0]
+    assert record["experiment_version"] == 3
+    assert record["skipped"] is True
+    assert record["skip_reason"] == reason
+    assert not any("jev" in key or key == "p_final_up" for key in record)
+    assert {"time_left_sec", "flow_60s", "spread_bps", "depth_ratio", "wall_text", "vol_60s", "fees_bps", "mid", "distance_from_start_bps"} <= record.keys()
+    assert not session.pending
+    report = generate_report(session.log.path, resolve_missing=False)
+    assert "Forecast Experiment V3" in report
+    assert "skipped: 1/1 (100.00%)" in report
+    assert "correlation Q1 vs distance_from_start_bps: r=n/a N=0" in report
+
+
+def test_one_enriched_q1_sent_before_jev_and_input_features_survive_response(monkeypatch, tmp_path):
+    session = experiment_session(monkeypatch, tmp_path)
+    calls = []
+    async def fake_jev(client, model, state, questions):
+        calls.append((state, questions))
+        assert "Time left: 800s" in state["meta"]
+        assert "Flow 60s:" in state["meta"]
+        assert "Fees: 7%" in state["meta"]
+        session.clob.apply_event({"event_type": "book", "asset_id": "up", "bids": [{"price": "0.59", "size": "100"}], "asks": [{"price": "0.60", "size": "100"}]})
+        return {"probabilities": {"p_final_up": 0.7}, "input_tokens": 100, "latency_ms": 1}
+    monkeypatch.setattr("forecast_experiment.call_jev_nouls_async", fake_jev)
+    payload = {"questions": build_questions()}
+    async def run():
+        result = await session._decide(payload)
+        now = datetime.now(timezone.utc)
+        await session._on_forecast(payload, result, now, now)
+    asyncio.run(run())
+    record = load_records(session.log.path)[0]
+    assert len(calls) == 1 and list(calls[0][1]) == ["p_final_up"]
+    assert record["mid"] == 0.495
+    assert record["response_state"]["up"]["ask"] == "0.60"
+    assert record["skipped"] is False and record["skip_reason"] is None
+    assert record["p_final_up"] == record["p_jev_up"] == 0.7
+    assert len(session.pending) == 4
+
+
+def test_v3_report_uses_input_correlations_excludes_skips_and_groups_flow(tmp_path):
+    path = tmp_path / "v3.jsonl"
+    records = []
+    for i, p in enumerate((0.3, 0.4, 0.7)):
+        records.append({"record_type": "forecast", "experiment_version": 3,
+            "decision_id": str(i), "p_final_up": p, "p_jev_up": p,
+            "distance_from_start_bps": p * 100, "time_left_sec": 900 - p * 100,
+            "flow_60s": {"status": "ready", "imbalance_usd": (i - 1) * 200, "up_count": i, "down_count": 1, "avg_size": 50, "net": i - 1},
+            "response_market_probabilities": {"p_market_up": "0.5"},
+        })
+    records.append({"record_type": "forecast_skip", "experiment_version": 3, "skipped": True, "skip_reason": "mid_above_0.90"})
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    pending_report = generate_report(path, resolve_missing=False)
+    assert "correlation Q1 vs distance_from_start_bps: r=1.0000 N=3" in pending_report
+    assert "correlation Q1 vs time_left_sec: r=-1.0000 N=3" in pending_report
+    assert "target |r|<0.6: FAIL" in pending_report
+    assert "skipped: 1/4 (25.00%)" in pending_report
+    JsonlWriter(path).write("market_resolved", winner="UP")
+    report = generate_report(path, resolve_missing=False)
+    assert "correct: N=1" in report
+    assert "incorrect: N=2" in report

@@ -123,12 +123,12 @@ target position. Комиссии читаются из текущего рын�
 
 Отдельный realtime-эксперимент не торгует и не управляет позициями. Он строит
 position-independent Jev forecasts по live Polymarket CLOB и Chainlink raw +
-TWAP60 из Polymarket RTDS. Jev отвечает одним Noul `resolve_up`; DOWN всегда
+TWAP60 из Polymarket RTDS. Jev отвечает одним Noul Q1 `p_final_up`; DOWN всегда
 вычисляется как бинарное дополнение. Input и post-inference response состояния
 логируются раздельно, а детерминированные 15/30/60/120-секундные labels измеряют
 симметричный market repricing и net PnL обеих сторон по executable bids. Report
 сравнивает Jev с normalized market и Chainlink baselines без trading controller.
-JSONL V2 помечен `experiment_version: 2`; старые forecast JSONL также читаются.
+JSONL V3 помечен `experiment_version: 3`; V2 и старые forecast JSONL также читаются.
 Лимит расходов Jev по умолчанию — `$0.15` на одну полную рыночную сессию.
 
 ```powershell
@@ -140,6 +140,65 @@ python forecast_experiment.py --asset BTC --max-jev-cost 0.15
 отчёт по сохранённой сессии:
 
 ```powershell
+python forecast_report.py data/forecast_btc_<window_start>.jsonl
+```
+
+V3 передаёт Jev человекочитаемый Meta state внутри объекта `{"meta": "..."}`.
+State пересобирается непосредственно перед запросом: `Time left`, `Fees`,
+`Flow 60s`, `Book`, `Wall`, `Chainlink vol 60s`. Это один прогноз финального
+резолва, а не отдельные вопросы о скальпе. Старые Blind/Meta в collector не меняются.
+
+- `time_left_sec = max(0, int(window_start + 900 - now))`;
+  `distance_from_start_bps` — Chainlink raw относительно наблюдаемого opening.
+- `flow_60s` — RTDS `activity/trades` с локальной проверкой slug и token ID.
+  Серверные фильтры `market_slug` и `event_slug` на проверке 2026-09-21
+  не отдавали сделки активного рынка; публичная подписка без фильтра их
+  отдаёт. Чужие рынки отбрасываются до помещения в deque.
+  Только BUY: `up_count`, `down_count`, `net = up_count - down_count`,
+  `avg_size` и средние по сторонам в USD (`price * size`),
+  `imbalance_usd = up_usd - down_usd`. SELL не превращается в BUY другой стороны.
+  Старые события и дубликаты отфильтровываются; без полной подписки в течение
+  60 секунд flow помечается `warming_up`/`unavailable`.
+- `mid` — ненормализованный UP midpoint. `spread_bps = (ask-bid)/mid * 10000`
+  для UP; в `book` также есть DOWN. 1% = 100 bps.
+  `depth_ratio` — отношение USD-глубины UP/DOWN по пяти лучшим bid и ask.
+- Стенка: размер лучшего уровня в shares строго больше 3 средних размеров
+  следующих пяти уровней и USD-размер строго больше
+  `max(1500, 0.25 * total_depth_usd)`. Здесь total depth — все bid и ask
+  данного outcome; проверяются BID/ASK для UP/DOWN. Менее шести уровней
+  недостаточно для обнаружения стенки.
+- `vol_60s` — population std последовательных log returns Chainlink raw
+  за последние 60 секунд, умноженная на 100, без annualization. История
+  ограничивается временем, а не 100 тиками. `choppy`: минимум две смены
+  направления и не менее половины переходов ненулевого направления;
+  иначе `trend`, для неизменной цены `flat`. Менее трёх точек даёт `null`
+  и `insufficient_data`; длительность покрытия также логируется.
+- `fees_bps` — ставка текущей fee schedule из того же parser, что использует
+  `live_trader.py`, не захардкоженные 2%. Эффективная комиссия конкретного
+  $10 BUY показана отдельно в `effective_buy_fees_bps`.
+
+До вызова Jev `mid < 0.10` или `mid > 0.90` даёт `forecast_skip` с
+`skipped: true`, `skip_reason`, `state_text` и всеми признаками, без Jev-полей.
+Равенство 0.10/0.90 допускается. Исчерпание бюджета тоже логируется как skip.
+Кандидаты поступают не чаще раза в секунду; во время запроса сохраняется
+последний кандидат. Поэтому skipped % — доля записанных кандидатов, не WS ticks.
+Для выполненного прогноза `skipped: false`, `skip_reason: null`,
+`p_jev_up` сохранён как совместимый alias `p_final_up`.
+
+Report показывает Pearson Q1 относительно входных `distance_from_start_bps`
+и `time_left_sec`, с целью **|r| < 0.6**, включая отрицательную зависимость.
+Он не подменяет входные цены ценами после ответа и не включает скипы.
+Для V2 используются pre-inference поля `input_state`. Недостаток данных
+или постоянная переменная даёт `n/a`, а не успешную проверку. Корреляции и
+доля скипов доступны до резолва; распределение flow для верных/неверных
+прогнозов появляется после официального резолва, только для полного flow.
+Один рынок не подтверждает общее снижение корреляции или рост win rate.
+
+Проверка V3 на полном следующем 15-минутном рынке (ключ только из environment):
+
+```powershell
+python -m pytest -q
+python forecast_experiment.py --asset BTC --max-jev-cost 0.05
 python forecast_report.py data/forecast_btc_<window_start>.jsonl
 ```
 

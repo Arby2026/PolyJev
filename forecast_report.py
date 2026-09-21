@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import time
 import zipfile
@@ -87,8 +88,7 @@ def resolve_missing_winner(
 def generate_report(path: Path, resolve_missing: bool = True) -> str:
     records = load_records(path)
     is_v2 = any(
-        item.get("record_type") == "forecast"
-        and int(item.get("experiment_version", 1)) >= 2
+        int(item.get("experiment_version", 1)) >= 2
         for item in records
     )
     if is_v2:
@@ -100,7 +100,7 @@ def generate_report(path: Path, resolve_missing: bool = True) -> str:
 def _generate_v2_report(
     path: Path, records: list[dict[str, Any]], resolve_missing: bool
 ) -> str:
-    forecasts = [item for item in records if item.get("record_type") == "forecast"]
+    forecasts = [item for item in records if item.get("record_type") == "forecast" and not item.get("skipped")]
     by_id = {item["decision_id"]: item for item in forecasts}
     labels = [item for item in records if item.get("record_type") == "label"]
     crossovers = [item for item in records if item.get("record_type") == "crossover"]
@@ -114,12 +114,14 @@ def _generate_v2_report(
     )
     if winner is None and resolve_missing:
         winner = resolve_missing_winner(path, records)
+    version = max((int(item.get("experiment_version", 1)) for item in records), default=2)
     lines = [
-        "Forecast Experiment V2 — side-neutral report",
+        f"Forecast Experiment V{version} — side-neutral report",
         "============================================",
         f"winner_side: {winner or 'settlement pending'}",
         "Observations within one market are highly correlated and are not independent market trials.",
     ]
+    lines.extend(_feature_diagnostics(records, forecasts, winner))
     if winner not in ("UP", "DOWN"):
         return "\n".join(lines)
     loser = "DOWN" if winner == "UP" else "UP"
@@ -248,6 +250,83 @@ def _generate_v2_report(
             f"mean_abs_delta={_fmt(_mean([abs(float(item['p_jev_up']) - _response_market_up(item)) for item in group]))}"
         )
     return "\n".join(lines)
+
+
+def pearson(pairs: Iterable[tuple[Any, Any]]) -> tuple[float | None, int]:
+    values = []
+    for left, right in pairs:
+        try:
+            x, y = float(left), float(right)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x) and math.isfinite(y):
+            values.append((x, y))
+    if len(values) < 3:
+        return None, len(values)
+    xs, ys = zip(*values)
+    if min(xs) == max(xs) or min(ys) == max(ys):
+        return None, len(values)
+    return statistics.correlation(xs, ys), len(values)
+
+
+def _input_feature(record: dict[str, Any], key: str) -> Any:
+    if key in record:
+        return record[key]
+    # V2 uses the pre-inference snapshot too; never correlate with later prices.
+    state = record.get("input_state", {})
+    if key == "distance_from_start_bps":
+        return state.get("chainlink", {}).get("raw_from_open_bps")
+    if key == "time_left_sec":
+        return state.get("time_remaining")
+    return None
+
+
+def _feature_diagnostics(records: list[dict[str, Any]], forecasts: list[dict[str, Any]], winner: str | None) -> list[str]:
+    candidates = [r for r in records if r.get("record_type") in ("forecast", "forecast_skip")]
+    skipped = [r for r in candidates if r.get("skipped")]
+    percentage = 100 * len(skipped) / len(candidates) if candidates else None
+    lines = [
+        "", f"skipped: {len(skipped)}/{len(candidates)} ({_fmt(percentage, 2)}%)",
+        "Skip denominator: logged candidates; at most one per second, coalesced during inference.",
+    ]
+    for reason, count in sorted(Counter(str(r.get("skip_reason")) for r in skipped).items()):
+        lines.append(f"  {reason}: {count}")
+    lines.append("Pearson correlations (Q1 = p_final_up; V2 alias p_jev_up; input-time features):")
+    for key in ("distance_from_start_bps", "time_left_sec"):
+        correlation, count = pearson(
+            (r.get("p_final_up", r.get("p_jev_up")), _input_feature(r, key)) for r in forecasts
+        )
+        target = "unavailable" if correlation is None else ("PASS" if abs(correlation) < 0.6 else "FAIL")
+        lines.append(f"correlation Q1 vs {key}: r={_fmt(correlation)} N={count} target |r|<0.6: {target}")
+    lines.append("Correlations are descriptive; one market does not establish a general improvement.")
+    v3 = [r for r in candidates if int(r.get("experiment_version", 1)) >= 3]
+    if v3:
+        lines.append("V3 input features (including skips), mean/min/max:")
+        for key in ("time_left_sec", "distance_from_start_bps", "mid", "spread_bps", "depth_ratio", "vol_60s", "fees_bps"):
+            values = [float(r[key]) for r in v3 if r.get(key) is not None]
+            lines.append(f"  {key}: N={len(values)} {_triple(values)}")
+        walls = sum(r.get("wall_text") not in (None, "none detected") for r in v3)
+        lines.append(f"  wall_text: detected in {walls}/{len(v3)} candidates")
+        lines.append(f"  vol_regime: {dict(Counter(r.get('vol_regime', 'unavailable') for r in v3))}")
+    lines.append("Flow 60s when Jev correct/incorrect (BUY UP USD minus BUY DOWN USD):")
+    if winner not in ("UP", "DOWN"):
+        lines.append("  settlement pending; correctness unavailable")
+        return lines
+    for correct, label in ((True, "correct"), (False, "incorrect")):
+        group = [r for r in forecasts if (
+            ("UP" if float(r.get("p_final_up", r.get("p_jev_up"))) >= 0.5 else "DOWN") == winner
+        ) == correct]
+        flows = [r["flow_60s"] for r in group if r.get("flow_60s", {}).get("status") == "ready"]
+        values = [float(f["imbalance_usd"]) for f in flows]
+        bins = [sum(v < -100 for v in values), sum(-100 <= v < 0 for v in values), sum(v == 0 for v in values), sum(0 < v <= 100 for v in values), sum(v > 100 for v in values)]
+        lines.append(
+            f"  {label}: N={len(flows)} unavailable_or_partial={len(group) - len(flows)} "
+            f"imbalance_usd mean/min/max={_triple(values)} median={_fmt(_median(values))} "
+            f"bins [<-100, -100..0, zero, 0..100, >100]={bins}"
+        )
+        for key in ("up_count", "down_count", "avg_size", "net"):
+            lines.append(f"    {key}: {_triple([float(f[key]) for f in flows])}")
+    return lines
 
 
 def _winner_metrics(record: dict[str, Any], winner: str) -> dict[str, float]:

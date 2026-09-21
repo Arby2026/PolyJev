@@ -26,6 +26,10 @@ from chainlink_live import (
     subscription_frame,
 )
 from jev import call_jev_nouls_async, create_jev_client
+from forecast_features import (
+    RawVolatility, TradeFlow, book_features, gate_reason,
+    render_meta_state, trades_subscription,
+)
 from live_market import LiveMarketState, iter_messages
 from live_trader import (
     DecisionScheduler,
@@ -190,7 +194,7 @@ def build_questions(
     time_remaining: int | None = None,
     entries: Mapping[str, ExecutionQuote] | None = None,
 ) -> dict[str, str]:
-    return {"resolve_up": RESOLVE_INSTRUCTION}
+    return {"p_final_up": RESOLVE_INSTRUCTION}
 
 
 def normalized_market_probabilities(
@@ -509,6 +513,40 @@ def build_compact_state(
     return state
 
 
+def build_enriched_state(
+    market: MarketInfo,
+    chainlink: ChainlinkLiveState,
+    clob: LiveMarketState,
+    entries: Mapping[str, ExecutionQuote],
+    flow: TradeFlow,
+    volatility: RawVolatility,
+    now: float,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    chain = chainlink.compact()
+    schedule = market.fee_schedule
+    features = {
+        "time_left_sec": max(0, int(market.window_start + 900 - now)),
+        "distance_from_start_bps": chain["raw_from_open_bps"],
+        "flow_60s": flow.snapshot(now),
+        **book_features(clob),
+        **volatility.snapshot(now),
+        "fees_bps": float(schedule.rate * 10000) if schedule.enabled else 0.0,
+        "fees_exponent": float(schedule.exponent),
+        "effective_buy_fees_bps": {
+            side: float(entry.fee / entry.gross_value * 10000)
+            if entry.fully_executable and entry.gross_value > 0 else None
+            for side, entry in entries.items()
+        },
+    }
+    economics = {
+        side: str(terminal_break_even(entry)) if entry.fully_executable else "unexecutable"
+        for side, entry in entries.items()
+    }
+    text = render_meta_state(market.asset, market.rules, chain, features, economics)
+    # The Decisions SDK expects an object; its Meta content is plain text.
+    return {"meta": text}, features
+
+
 def capture_realtime_state(
     market: MarketInfo,
     chainlink: ChainlinkLiveState,
@@ -633,6 +671,8 @@ class ForecastExperiment:
         self.asset = asset
         self.symbol = "btc/usd" if asset == "BTC" else "eth/usd"
         self.chainlink = ChainlinkLiveState(self.symbol)
+        self.volatility = RawVolatility()
+        self.flow: TradeFlow | None = None
         self.cost = CostGuard(max_jev_cost)
         self.client = create_jev_client()
         self.stop = asyncio.Event()
@@ -653,6 +693,8 @@ class ForecastExperiment:
         self.labels_by_horizon = {horizon: 0 for horizon in HORIZONS}
         self.liquidity_warning = False
         self.resolution_pending = True
+        self.last_sample_second: int | None = None
+        self.skipped = 0
 
     async def run(self) -> None:
         if not os.environ.get("OPENROUTER_API_KEY", "").strip():
@@ -669,6 +711,7 @@ class ForecastExperiment:
                 discover_forecast_market, self.asset, next_window
             )
             self.market, self.http_session, self.config = market, session, config
+            self.flow = TradeFlow(market.slug, market.up_token, market.down_token)
             self.clob = LiveMarketState(market.up_token, market.down_token)
             self.clob.tick_size = market.minimum_tick_size
             self.log = JsonlWriter(
@@ -678,8 +721,8 @@ class ForecastExperiment:
             )
             self.log.write(
                 "session_start",
-                experiment_version=2,
-                schema_version=2,
+                experiment_version=3,
+                schema_version=3,
                 started_at=self.started_at.isoformat(),
                 market_slug=market.slug,
                 asset=self.asset,
@@ -712,6 +755,7 @@ class ForecastExperiment:
                 self._can_start_decision,
             )
             clob_task = asyncio.create_task(self._clob_reader())
+            trades_task = asyncio.create_task(self._trades_reader())
             label_task = asyncio.create_task(self._label_resolver())
             ticker_task = asyncio.create_task(self._second_ticker())
             await self._wait_for_market_end_and_resolution()
@@ -719,9 +763,9 @@ class ForecastExperiment:
                 await self.scheduler.wait_idle()
             await self._resolve_all_due(force_market_end=True)
             self.stop.set()
-            for task in (clob_task, label_task, ticker_task):
+            for task in (clob_task, trades_task, label_task, ticker_task):
                 task.cancel()
-            await asyncio.gather(clob_task, label_task, ticker_task, return_exceptions=True)
+            await asyncio.gather(clob_task, trades_task, label_task, ticker_task, return_exceptions=True)
             self._finish_session()
         finally:
             self.stop.set()
@@ -763,6 +807,8 @@ class ForecastExperiment:
                                     continue
                                 message = json.loads(raw)
                                 if isinstance(message, Mapping) and self.chainlink.apply(message):
+                                    if message.get("topic") == RAW_TOPIC:
+                                        self.volatility.add(self.chainlink.raw_updates[-1], time.time())
                                     self.state_changed.set()
                                     self._record_observed_crossovers()
                                     self._submit_latest()
@@ -777,6 +823,40 @@ class ForecastExperiment:
                 if not self.stop.is_set():
                     print(f"RTDS disconnected: {exc}; reconnecting", file=sys.stderr)
                     await asyncio.sleep(1)
+
+    async def _trades_reader(self) -> None:
+        assert self.market is not None and self.flow is not None
+        while not self.stop.is_set():
+            try:
+                async with connect(RTDS_URL, ping_interval=None, close_timeout=2) as websocket:
+                    await websocket.send(json.dumps(trades_subscription()))
+                    self.flow.connected_since = time.time()
+                    print(f"RTDS trades connected: {self.market.slug}")
+                    heartbeat = asyncio.create_task(self._heartbeat(websocket, 5))
+                    try:
+                        async for raw in websocket:
+                            if self.stop.is_set():
+                                break
+                            if not raw or raw == "PONG":
+                                continue
+                            try:
+                                for message in iter_messages(json.loads(raw)):
+                                    if self.flow.apply(message, time.time()):
+                                        self._submit_latest()
+                            except (ValueError, TypeError) as exc:
+                                print(f"RTDS trade ignored: {exc}", file=sys.stderr)
+                    finally:
+                        self.flow.connected_since = None
+                        heartbeat.cancel()
+                        await asyncio.gather(heartbeat, return_exceptions=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self.stop.is_set():
+                    print(f"RTDS trades disconnected: {exc}; reconnecting", file=sys.stderr)
+                    await asyncio.sleep(1)
+            finally:
+                self.flow.connected_since = None
 
     async def _clob_reader(self) -> None:
         assert self.market is not None and self.clob is not None
@@ -845,8 +925,7 @@ class ForecastExperiment:
 
     def _can_start_decision(self) -> bool:
         return bool(
-            self.cost.can_request
-            and self.market is not None
+            self.market is not None
             and time.time() < self.market.window_end
             and self.clob is not None
             and self.clob.resolved_winner is None
@@ -862,16 +941,20 @@ class ForecastExperiment:
             or not self._can_start_decision()
         ):
             return
-        entries = hypothetical_entries(self.clob, self.market.fee_schedule)
-        model_state = build_compact_state(self.market, self.chainlink, self.clob, entries)
+        # One candidate per second, coalesced during inference. This also keeps
+        # gate logging bounded when no API latency limits the scheduler.
+        sample_second = int(time.time())
+        if sample_second == self.last_sample_second:
+            return
+        self.last_sample_second = sample_second
         payload = {
-            "jev_state": model_state,
+            "jev_state": {"sample_second": sample_second},
             "questions": build_questions(),
         }
         self.scheduler.submit(payload)
 
     async def _decide(self, payload: dict[str, Any]) -> dict[str, Any]:
-        assert self.market is not None and self.clob is not None
+        assert self.market is not None and self.clob is not None and self.flow is not None
         if not self.clob.trade_ready() or not self.chainlink.ready:
             raise RuntimeError("input state is not ready")
         input_epoch = time.time()
@@ -881,9 +964,16 @@ class ForecastExperiment:
         payload["input_state"] = capture_realtime_state(
             self.market, self.chainlink, self.clob, input_entries, input_epoch
         )
-        payload["jev_state"] = build_compact_state(
-            self.market, self.chainlink, self.clob, input_entries, input_epoch
+        payload["jev_state"], payload["features"] = build_enriched_state(
+            self.market, self.chainlink, self.clob, input_entries,
+            self.flow, self.volatility, input_epoch,
         )
+        reason = gate_reason(payload["features"]["mid"])
+        if reason is None and not self.cost.can_request:
+            reason = "budget_exhausted"
+        if reason is not None:
+            return {"skipped": True, "skip_reason": reason}
+        print(payload["jev_state"]["meta"])
         return await call_jev_nouls_async(
             self.client,
             JEV_MODEL,
@@ -903,8 +993,21 @@ class ForecastExperiment:
     ) -> None:
         assert self.market is not None and self.log is not None and self.clob is not None
         decision_id = str(uuid.uuid4())
+        if result.get("skipped"):
+            self.skipped += 1
+            self.log.write(
+                "forecast_skip", experiment_version=3, schema_version=3,
+                decision_id=decision_id, market_slug=self.market.slug,
+                input_timestamp=payload["input_timestamp"],
+                input_state=payload["input_state"],
+                state_text=payload["jev_state"]["meta"],
+                skipped=True, skip_reason=result["skip_reason"],
+                **payload["features"],
+            )
+            print(f"SKIP {result['skip_reason']}\n{payload['jev_state']['meta']}")
+            return
         answers = result["probabilities"]
-        p_up = answers["resolve_up"]
+        p_up = answers["p_final_up"]
         input_entries: dict[str, ExecutionQuote] = payload["input_entries"]
         input_edges = terminal_edges(p_up, input_entries)
         response_epoch = time.time()
@@ -929,8 +1032,8 @@ class ForecastExperiment:
         self.latencies.append(float(result["latency_ms"]))
         self.log.write(
             "forecast",
-            experiment_version=2,
-            schema_version=2,
+            experiment_version=3,
+            schema_version=3,
             decision_id=decision_id,
             input_timestamp=payload["input_timestamp"],
             response_timestamp=response_epoch,
@@ -941,7 +1044,12 @@ class ForecastExperiment:
             input_state=payload["input_state"],
             response_state=response_state,
             compact_state_sent_to_jev=payload["jev_state"],
-            question_ids=["resolve_up"],
+            state_text=payload["jev_state"]["meta"],
+            **payload["features"],
+            skipped=False,
+            skip_reason=None,
+            question_ids=["p_final_up"],
+            p_final_up=p_up,
             p_jev_up=p_up,
             p_jev_down=1 - p_up,
             input_market_probabilities={
@@ -1064,8 +1172,8 @@ class ForecastExperiment:
             self.labels_by_horizon[label.horizon] += int(base_status == "valid")
             self.log.write(
                 "label",
-                experiment_version=2,
-                schema_version=2,
+                experiment_version=3,
+                schema_version=3,
                 decision_id=label.decision_id,
                 horizon=label.horizon,
                 target_timestamp=label.target_epoch,
@@ -1169,8 +1277,8 @@ class ForecastExperiment:
             return
         self.log.write(
             "crossover",
-            experiment_version=2,
-            schema_version=2,
+            experiment_version=3,
+            schema_version=3,
             source=source,
             timestamp=timestamp,
             from_side=previous,
@@ -1182,8 +1290,8 @@ class ForecastExperiment:
         assert self.market is not None and self.clob is not None and self.log is not None
         metrics = self.cost.metrics()
         summary = {
-            "experiment_version": 2,
-            "schema_version": 2,
+            "experiment_version": 3,
+            "schema_version": 3,
             "market": self.market.slug,
             "winner": self.clob.resolved_winner,
             "settlement_pending": self.resolution_pending,
@@ -1191,6 +1299,8 @@ class ForecastExperiment:
             "chainlink_raw_events": self.chainlink.raw_events,
             "chainlink_twap_events": self.chainlink.twap_events,
             "jev_requests": len(self.cost.input_tokens),
+            "skipped": self.skipped,
+            "trades_buy_events": self.flow.events if self.flow else 0,
             "avg_latency_ms": (
                 sum(self.latencies) / len(self.latencies) if self.latencies else 0
             ),
