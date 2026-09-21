@@ -16,7 +16,12 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Mapping
 
+from dotenv import load_dotenv
 from websockets.asyncio.client import connect
+
+if not os.getenv("OPENROUTER_API_KEY", "").strip() and Path(".env").exists():
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    load_dotenv(dotenv_path=Path(".env"))
 
 from chainlink_live import (
     RAW_TOPIC,
@@ -524,13 +529,21 @@ def build_enriched_state(
 ) -> tuple[dict[str, str], dict[str, Any]]:
     chain = chainlink.compact()
     schedule = market.fee_schedule
+    book = book_features(clob)
+    fee_rate = schedule.rate if schedule.enabled else Decimal("0")
     features = {
         "time_left_sec": max(0, int(market.window_start + 900 - now)),
         "distance_from_start_bps": chain["raw_from_open_bps"],
         "flow_60s": flow.snapshot(now),
-        **book_features(clob),
+        **book,
         **volatility.snapshot(now),
-        "fees_bps": float(schedule.rate * 10000) if schedule.enabled else 0.0,
+        "fee_schedule_bps": float(fee_rate * 10000),
+        "fee_effective_up_bps": float(
+            fee_rate * (1 - Decimal(str(book["book"]["up"]["mid"]))) * 10000
+        ),
+        "fee_effective_down_bps": float(
+            fee_rate * (1 - Decimal(str(book["book"]["down"]["mid"]))) * 10000
+        ),
         "fees_exponent": float(schedule.exponent),
         "effective_buy_fees_bps": {
             side: float(entry.fee / entry.gross_value * 10000)
@@ -698,7 +711,10 @@ class ForecastExperiment:
 
     async def run(self) -> None:
         if not os.environ.get("OPENROUTER_API_KEY", "").strip():
-            raise RuntimeError("OPENROUTER_API_KEY is not set")
+            raise RuntimeError(
+                "Установите OPENROUTER_API_KEY в окружении Windows (Окружения) "
+                "или в .env, см .env.example"
+            )
         next_window = (int(time.time()) // 900 + 1) * 900
         print(f"Waiting for full {self.asset} market at {next_window} UTC epoch")
         rtds_task = asyncio.create_task(self._rtds_reader())

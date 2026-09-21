@@ -188,7 +188,7 @@ def render_meta_state(asset: str, rule: str, chain: Mapping[str, Any], features:
         f"Time left: {left}s ({(900 - left) / 9:.0f}% elapsed)",
         f"Chainlink start {chain['open']}, raw {chain['raw']}, distance from start {features['distance_from_start_bps']:+.2f} bps; TWAP60 {chain['twap60']} ({chain['twap_from_open_bps']:+.2f} bps from start).",
         f"Raw changes: last 1/5/20 updates {chain['raw_d1']}/{chain['raw_d5']}/{chain['raw_d20']} bps.",
-        f"Fees: {features['fees_bps'] / 100:g}% taker schedule rate; exponent {features['fees_exponent']:g}. Effective $10 BUY fees: UP {features['effective_buy_fees_bps']['UP']} bps, DOWN {features['effective_buy_fees_bps']['DOWN']} bps.",
+        f"Fees: UP {features['fee_effective_up_bps']:.1f} bps / DOWN {features['fee_effective_down_bps']:.1f} bps effective taker estimates for $10 at current mids; schedule {features['fee_schedule_bps']:.0f} bps, exponent {features['fees_exponent']:g}. Executable $10 BUY fees: UP {features['effective_buy_fees_bps']['UP']} bps, DOWN {features['effective_buy_fees_bps']['DOWN']} bps.",
         f"Flow 60s: {flow['up_count']} BUY UP (avg ${flow['up_avg_size']:.0f}) vs {flow['down_count']} BUY DOWN (avg ${flow['down_avg_size']:.0f}), net {flow['net']:+d} UP (${flow['imbalance_usd']:+.0f}); {flow['status']}, coverage {flow['coverage_sec']:.0f}s.",
         f"Book UP bid {up['bid']:.3f} ${up['bid_usd']:.0f} / ask {up['ask']:.3f} ${up['ask_usd']:.0f}, DOWN {down['bid']:.3f} ${down['bid_usd']:.0f} / {down['ask']:.3f} ${down['ask_usd']:.0f}, spread {spread / 100:.2f}% ({spread:.1f} bps), depth UP/DOWN " + (f"{ratio:.2f}x" if ratio is not None else "unavailable") + " (top 5 bids + asks, USD).",
         f"Wall: {features['wall_text']}",

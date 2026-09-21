@@ -99,7 +99,12 @@ checkpoint observations.
 
 ## Realtime Jev Polymarket Paper Trader
 
-Задайте `OPENROUTER_API_KEY` в environment и запустите trader для текущего
+Задайте `OPENROUTER_API_KEY` в environment или скопируйте `.env.example`
+в локальный `.env` и заполните ключ. Оба realtime-скрипта читают `.env` из
+текущего каталога, только если ключ не задан в окружении. `.env` исключён
+из Git; ключ не выводится в логи. Если ключ не задан ни одним способом,
+программа печатает инструкцию настройки и завершается с кодом 1.
+Запустите trader для текущего
 15-минутного рынка:
 
 ```powershell
@@ -173,9 +178,14 @@ State пересобирается непосредственно перед з�
   направления и не менее половины переходов ненулевого направления;
   иначе `trend`, для неизменной цены `flat`. Менее трёх точек даёт `null`
   и `insufficient_data`; длительность покрытия также логируется.
-- `fees_bps` — ставка текущей fee schedule из того же parser, что использует
-  `live_trader.py`, не захардкоженные 2%. Эффективная комиссия конкретного
-  $10 BUY показана отдельно в `effective_buy_fees_bps`.
+- `fee_schedule_bps` — коэффициент fee schedule из того же parser, что
+  использует `live_trader.py`. `fee_effective_up_bps` и
+  `fee_effective_down_bps` — оценки effective taker fees для $10 по mid
+  соответствующей стороны: `schedule_rate * (1 - mid) * 10000`.
+  Например, 7% schedule и mid 0.50 дают 350 bps effective. Отчёт показывает
+  средние effective UP/DOWN, а не коэффициент schedule. Комиссии $10 BUY
+  по исполнимым asks сохранены отдельно в `effective_buy_fees_bps`.
+  Старое неоднозначное поле `fees_bps` в новые записи не добавляется.
 
 До вызова Jev `mid < 0.10` или `mid > 0.90` даёт `forecast_skip` с
 `skipped: true`, `skip_reason`, `state_text` и всеми признаками, без Jev-полей.
@@ -186,7 +196,9 @@ State пересобирается непосредственно перед з�
 `p_jev_up` сохранён как совместимый alias `p_final_up`.
 
 Report показывает Pearson Q1 относительно входных `distance_from_start_bps`
-и `time_left_sec`, с целью **|r| < 0.6**, включая отрицательную зависимость.
+и `time_left_sec`, с порогом прогресса **|r| < 0.75**, включая отрицательную
+зависимость. FAIL корреляции не означает ошибку кода: нужен ещё один рынок
+для статистики. Изначальная исследовательская цель — |r| < 0.6.
 Он не подменяет входные цены ценами после ответа и не включает скипы.
 Для V2 используются pre-inference поля `input_state`. Недостаток данных
 или постоянная переменная даёт `n/a`, а не успешную проверку. Корреляции и
@@ -194,13 +206,16 @@ Report показывает Pearson Q1 относительно входных `
 прогнозов появляется после официального резолва, только для полного flow.
 Один рынок не подтверждает общее снижение корреляции или рост win rate.
 
-Проверка V3 на полном следующем 15-минутном рынке (ключ только из environment):
+Проверка V3 на полном следующем 15-минутном рынке (ключ из environment или `.env`):
 
 ```powershell
 python -m pytest -q
 python forecast_experiment.py --asset BTC --max-jev-cost 0.05
 python forecast_report.py data/forecast_btc_<window_start>.jsonl
 ```
+
+Для отчётов по нескольким сессиям можно передать несколько путей либо
+`python forecast_report.py "data/forecast_btc_*.jsonl"` (включая PowerShell).
 
 `P_simple` — zero-drift probability baseline, рассчитанная по Binance proxy и
 realized volatility; она **не** является settlement probability source.

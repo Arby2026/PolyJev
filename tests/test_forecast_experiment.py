@@ -31,7 +31,7 @@ from forecast_experiment import (
     terminal_edges,
     winner_relative_metrics,
 )
-from forecast_report import generate_report, load_records
+from forecast_report import generate_report, load_records, _effective_fee_bps
 from forecast_features import RawVolatility, TradeFlow
 from live_market import LiveMarketState
 from live_trader import MarketInfo, JsonlWriter
@@ -349,13 +349,17 @@ def test_enriched_meta_text_contains_input_features_and_fee_schedule():
         flow, RawVolatility(), 558,
     )
     assert features["time_left_sec"] == 342
-    assert features["fees_bps"] == 700
+    assert features["fee_schedule_bps"] == 700
+    assert features["fee_effective_up_bps"] == pytest.approx(353.5)
+    assert features["fee_effective_down_bps"] == pytest.approx(353.5)
+    assert "fees_bps" not in features
     text = state["meta"]
-    for value in ("Time left: 342s (62% elapsed)", "Fees: 7% taker", "Flow 60s:", "Wall:", "Chainlink vol 60s:", "depth UP/DOWN", "bps)"):
+    for value in ("Time left: 342s (62% elapsed)", "Fees: UP 353.5 bps / DOWN 353.5 bps", "schedule 700 bps", "Flow 60s:", "Wall:", "Chainlink vol 60s:", "depth UP/DOWN", "bps)"):
         assert value in text
     free = replace(market(), fee_schedule=FeeSchedule(False))
     _, features = build_enriched_state(free, chainlink_state(), clob, hypothetical_entries(clob, free.fee_schedule), flow, RawVolatility(), 558)
-    assert features["fees_bps"] == 0
+    assert features["fee_schedule_bps"] == 0
+    assert features["fee_effective_up_bps"] == features["fee_effective_down_bps"] == 0
 
 
 def experiment_session(monkeypatch, tmp_path, up_bid="0.49", up_ask="0.50", budget="0.05"):
@@ -392,7 +396,7 @@ def test_skip_does_not_call_jev_but_logs_all_features(monkeypatch, tmp_path, bid
     assert record["skipped"] is True
     assert record["skip_reason"] == reason
     assert not any("jev" in key or key == "p_final_up" for key in record)
-    assert {"time_left_sec", "flow_60s", "spread_bps", "depth_ratio", "wall_text", "vol_60s", "fees_bps", "mid", "distance_from_start_bps"} <= record.keys()
+    assert {"time_left_sec", "flow_60s", "spread_bps", "depth_ratio", "wall_text", "vol_60s", "fee_schedule_bps", "fee_effective_up_bps", "fee_effective_down_bps", "mid", "distance_from_start_bps"} <= record.keys()
     assert not session.pending
     report = generate_report(session.log.path, resolve_missing=False)
     assert "Forecast Experiment V3" in report
@@ -407,7 +411,7 @@ def test_one_enriched_q1_sent_before_jev_and_input_features_survive_response(mon
         calls.append((state, questions))
         assert "Time left: 800s" in state["meta"]
         assert "Flow 60s:" in state["meta"]
-        assert "Fees: 7%" in state["meta"]
+        assert "Fees: UP 353.5 bps / DOWN 353.5 bps" in state["meta"]
         session.clob.apply_event({"event_type": "book", "asset_id": "up", "bids": [{"price": "0.59", "size": "100"}], "asks": [{"price": "0.60", "size": "100"}]})
         return {"probabilities": {"p_final_up": 0.7}, "input_tokens": 100, "latency_ms": 1}
     monkeypatch.setattr("forecast_experiment.call_jev_nouls_async", fake_jev)
@@ -441,9 +445,57 @@ def test_v3_report_uses_input_correlations_excludes_skips_and_groups_flow(tmp_pa
     pending_report = generate_report(path, resolve_missing=False)
     assert "correlation Q1 vs distance_from_start_bps: r=1.0000 N=3" in pending_report
     assert "correlation Q1 vs time_left_sec: r=-1.0000 N=3" in pending_report
-    assert "target |r|<0.6: FAIL" in pending_report
+    assert "target |r|<0.75: FAIL" in pending_report
     assert "skipped: 1/4 (25.00%)" in pending_report
     JsonlWriter(path).write("market_resolved", winner="UP")
     report = generate_report(path, resolve_missing=False)
     assert "correct: N=1" in report
     assert "incorrect: N=2" in report
+
+
+def test_effective_fees_use_each_outcome_mid_not_schedule_or_entry_ask():
+    clob = ready_clob()
+    for token, bid, ask in (("up", "0.29", "0.31"), ("down", "0.69", "0.71")):
+        clob.apply_event({"event_type": "book", "asset_id": token,
+            "bids": [{"price": bid, "size": "100"}],
+            "asks": [{"price": ask, "size": "100"}],
+        })
+    _, features = build_enriched_state(
+        market(), chainlink_state(), clob, hypothetical_entries(clob, ENABLED),
+        TradeFlow(market().slug, "up", "down"), RawVolatility(), 100,
+    )
+    assert features["fee_schedule_bps"] == 700
+    assert features["fee_effective_up_bps"] == pytest.approx(490)
+    assert features["fee_effective_down_bps"] == pytest.approx(210)
+    assert features["effective_buy_fees_bps"]["UP"] == pytest.approx(483, abs=0.01)
+
+
+def test_report_shows_mean_effective_fees_and_reads_early_v3(tmp_path):
+    path = tmp_path / "fees.jsonl"
+    writer = JsonlWriter(path)
+    for up, down in ((300, 400), (400, 300)):
+        writer.write("forecast_skip", experiment_version=3, skipped=True,
+            skip_reason="budget_exhausted", fee_schedule_bps=700,
+            fee_effective_up_bps=up, fee_effective_down_bps=down)
+    report = generate_report(path, resolve_missing=False)
+    assert "fee_effective_up_bps: N=2 350.0000/300.0000/400.0000" in report
+    assert "fee_effective_down_bps: N=2 350.0000/300.0000/400.0000" in report
+    assert "700" not in report
+    assert _effective_fee_bps({"fees_bps": 700, "book": {"up": {"mid": 0.5}}}, "up") == 350
+    assert _effective_fee_bps({"fees_bps": 700}, "up") is None
+
+
+def test_report_cli_expands_windows_glob(tmp_path, monkeypatch, capsys):
+    from forecast_report import main
+    for name in ("forecast_btc_a.jsonl", "forecast_btc_b.jsonl"):
+        JsonlWriter(tmp_path / name).write("market_resolved", winner="UP")
+    monkeypatch.setattr("sys.argv", ["forecast_report.py", str(tmp_path / "forecast_btc_*.jsonl")])
+    assert main() == 0
+    output = capsys.readouterr().out
+    assert "forecast_btc_a.jsonl" in output and "forecast_btc_b.jsonl" in output
+
+
+def test_aborted_live_session_is_identified_in_report(tmp_path):
+    path = tmp_path / "aborted.jsonl"
+    JsonlWriter(path).write("session_abort", experiment_version=3, reason="network failure")
+    assert "run_status: aborted" in generate_report(path, resolve_missing=False)

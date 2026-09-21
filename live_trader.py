@@ -17,11 +17,16 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
+from dotenv import load_dotenv
 import requests
 import yaml
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from websockets.asyncio.client import connect
+
+if not os.getenv("OPENROUTER_API_KEY", "").strip() and Path(".env").exists():
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    load_dotenv(dotenv_path=Path(".env"))
 
 from jev import call_jev_choice_async, create_jev_client
 from live_market import LiveMarketState, iter_messages
@@ -176,7 +181,10 @@ def state_fingerprint(state: Mapping[str, Any]) -> str:
 
 def discover_current_market(asset: str, notional: Decimal) -> tuple[MarketInfo, Any, dict[str, Any]]:
     if not os.environ.get("OPENROUTER_API_KEY", "").strip():
-        raise RuntimeError("OPENROUTER_API_KEY is not set")
+        raise RuntimeError(
+            "Установите OPENROUTER_API_KEY в окружении Windows (Окружения) "
+            "или в .env, см .env.example"
+        )
     config = _load_config()
     session = _create_http_session(int(config["http_retries"]))
     now = time.time()
