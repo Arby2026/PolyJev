@@ -81,6 +81,24 @@ class LabelResult:
     book_age_ms: float | None
 
 
+@dataclass(frozen=True)
+class ForecastPendingLabel:
+    decision_id: str
+    horizon: int
+    target_epoch: float
+    due_monotonic: float
+    response_p_market_up: float
+    p_jev_up: float
+    response_entries: Mapping[str, ExecutionQuote]
+
+
+@dataclass(frozen=True)
+class SideFutureResult:
+    status: str
+    exit_quote: ExecutionQuote | None
+    net_pnl: Decimal | None
+
+
 class CostGuard:
     def __init__(self, maximum_usd: Decimal):
         if maximum_usd < 0:
@@ -169,25 +187,172 @@ def discover_forecast_market(
 
 
 def build_questions(
-    time_remaining: int,
-    entries: Mapping[str, ExecutionQuote],
+    time_remaining: int | None = None,
+    entries: Mapping[str, ExecutionQuote] | None = None,
 ) -> dict[str, str]:
-    questions = {"resolve_up": RESOLVE_INSTRUCTION}
-    for side in ("UP", "DOWN"):
-        entry = entries.get(side)
-        if entry is None or not entry.fully_executable:
-            continue
-        for horizon in HORIZONS:
-            if time_remaining <= horizon + 2:
-                continue
-            name = f"{side.lower()}_profit_{horizon}s"
-            questions[name] = (
-                f"If $10 gross notional of {side} were bought now using the current "
-                f"executable asks and Polymarket taker fees, will the full position be "
-                f"sellable {horizon} seconds from now using executable bids with net PnL "
-                "greater than zero after both entry and exit taker fees?"
+    return {"resolve_up": RESOLVE_INSTRUCTION}
+
+
+def normalized_market_probabilities(
+    up_bid: Decimal,
+    up_ask: Decimal,
+    down_bid: Decimal,
+    down_ask: Decimal,
+) -> dict[str, Decimal]:
+    up_mid = (up_bid + up_ask) / Decimal("2")
+    down_mid = (down_bid + down_ask) / Decimal("2")
+    denominator = up_mid + down_mid
+    if denominator <= 0:
+        raise ValueError("market midpoint denominator must be positive")
+    return {
+        "up_mid": up_mid,
+        "down_mid": down_mid,
+        "mid_sum": denominator,
+        "p_market_up": up_mid / denominator,
+        "p_market_down": down_mid / denominator,
+    }
+
+
+def market_probabilities(clob: LiveMarketState) -> dict[str, Decimal]:
+    if not clob.trade_ready():
+        raise RuntimeError("CLOB state is not trade-ready")
+    return normalized_market_probabilities(
+        clob.up.best_bid,
+        clob.up.best_ask,
+        clob.down.best_bid,
+        clob.down.best_ask,
+    )
+
+
+def probability_sides(
+    p_jev_up: float, p_market_up: Decimal, epsilon: Decimal = Decimal("0.000000001")
+) -> dict[str, Any]:
+    jev_up = Decimal(str(p_jev_up))
+    jev_down = Decimal("1") - jev_up
+    market_down = Decimal("1") - p_market_up
+    delta_up = jev_up - p_market_up
+    delta_down = jev_down - market_down
+    relative = "NONE"
+    if delta_up > epsilon:
+        relative = "UP"
+    elif delta_down > epsilon:
+        relative = "DOWN"
+    return {
+        "p_jev_up": jev_up,
+        "p_jev_down": jev_down,
+        "probability_delta_up": delta_up,
+        "probability_delta_down": delta_down,
+        "relative_side": relative,
+        "jev_side": "UP" if jev_up >= Decimal("0.5") else "DOWN",
+        "market_side": "UP" if p_market_up >= Decimal("0.5") else "DOWN",
+    }
+
+
+def chainlink_sides(chainlink: ChainlinkLiveState) -> dict[str, str]:
+    if not chainlink.ready or chainlink.opening is None:
+        raise RuntimeError("Chainlink state is not ready")
+    opening = chainlink.opening.price
+    return {
+        "raw_side": "UP" if chainlink.raw_updates[-1].value >= opening else "DOWN",
+        "twap_side": "UP" if chainlink.twap_updates[-1].value >= opening else "DOWN",
+    }
+
+
+def select_best_edge(edges: Mapping[str, Decimal | None]) -> dict[str, Any]:
+    up = edges.get("model_terminal_edge_up")
+    down = edges.get("model_terminal_edge_down")
+    up_value = up if up is not None else Decimal("-Infinity")
+    down_value = down if down is not None else Decimal("-Infinity")
+    if up_value > down_value and up_value > 0:
+        side = "UP"
+        best = up
+        opposite = down
+    elif down_value > up_value and down_value > 0:
+        side = "DOWN"
+        best = down
+        opposite = up
+    else:
+        side = "NONE"
+        best = max(up_value, down_value)
+        if not best.is_finite():
+            best = None
+        opposite = min(up_value, down_value)
+        if not opposite.is_finite():
+            opposite = None
+    return {
+        "best_edge_side": side,
+        "best_edge_value": best,
+        "opposite_edge_value": opposite,
+    }
+
+
+def signed_repricing(
+    p_jev_up: float, response_p_market_up: float, future_p_market_up: float
+) -> float:
+    delta = p_jev_up - response_p_market_up
+    direction = 1 if delta > 0 else -1 if delta < 0 else 0
+    return direction * (future_p_market_up - response_p_market_up)
+
+
+def disagreement_side_pnl(
+    p_jev_up: float,
+    p_market_up: float,
+    up_pnl: Decimal | None,
+    down_pnl: Decimal | None,
+) -> Decimal | None:
+    if p_jev_up > p_market_up:
+        return up_pnl
+    if p_jev_up < p_market_up:
+        return down_pnl
+    return None
+
+
+def classify_winner_loser_edges(
+    winner: str, edge_up: Decimal | None, edge_down: Decimal | None
+) -> str:
+    winner_edge = edge_up if winner == "UP" else edge_down
+    loser_edge = edge_down if winner == "UP" else edge_up
+    winner_positive = winner_edge is not None and winner_edge > 0
+    loser_positive = loser_edge is not None and loser_edge > 0
+    if winner_positive and loser_positive:
+        return "BOTH"
+    if winner_positive:
+        return "WINNER_EDGE_ONLY"
+    if loser_positive:
+        return "LOSER_EDGE_ONLY"
+    return "NEITHER"
+
+
+def detect_transitions(
+    values: list[tuple[float, str, int]], source: str
+) -> list[dict[str, Any]]:
+    transitions: list[dict[str, Any]] = []
+    previous: str | None = None
+    for timestamp, side, time_remaining in values:
+        if previous is not None and side != previous:
+            transitions.append(
+                {
+                    "source": source,
+                    "timestamp": timestamp,
+                    "from_side": previous,
+                    "to_side": side,
+                    "time_remaining": time_remaining,
+                }
             )
-    return questions
+        previous = side
+    return transitions
+
+
+def winner_relative_metrics(record: Mapping[str, Any], winner: str) -> dict[str, float]:
+    p_jev_up = float(record["p_jev_up"])
+    p_market_up = float(record["response_market_probabilities"]["p_market_up"])
+    y_up = 1.0 if winner == "UP" else 0.0
+    return {
+        "p_jev_winner": p_jev_up if winner == "UP" else 1 - p_jev_up,
+        "p_market_winner": p_market_up if winner == "UP" else 1 - p_market_up,
+        "jev_brier": (p_jev_up - y_up) ** 2,
+        "market_brier": (p_market_up - y_up) ** 2,
+    }
 
 
 def terminal_break_even(entry: ExecutionQuote) -> Decimal:
@@ -290,13 +455,15 @@ def build_compact_state(
 ) -> dict[str, Any]:
     current_time = time.time() if now is None else now
     summary = clob.summary()
+    chainlink_compact = chainlink.compact()
+    chainlink_compact.pop("twap_recent", None)
     state: dict[str, Any] = {
         "market": {
             "asset": market.asset,
             "left_s": max(0, int(market.window_end - current_time)),
             "rule": market.rules,
         },
-        "chainlink": chainlink.compact(),
+        "chainlink": chainlink_compact,
     }
     for side, key in (("UP", "up"), ("DOWN", "down")):
         item = summary[key]
@@ -334,17 +501,93 @@ def build_compact_state(
             continue
         economics[side.lower()] = {
             "entry_executable": True,
-            "entry_vwap": _model_decimal(entry.vwap, market.minimum_tick_size),
-            "entry_fee": _model_decimal(entry.fee, Decimal("0.00001")),
             "terminal_break_even": _model_decimal(
                 terminal_break_even(entry), Decimal("0.00001")
             ),
-            "break_even_exit_bid": _model_decimal(
-                break_even_exit_bid(entry, market.fee_schedule), Decimal("0.00001")
-            ),
         }
-    state["economics"] = economics
+    state["terminal_economics"] = economics
     return state
+
+
+def capture_realtime_state(
+    market: MarketInfo,
+    chainlink: ChainlinkLiveState,
+    clob: LiveMarketState,
+    entries: Mapping[str, ExecutionQuote],
+    timestamp: float,
+) -> dict[str, Any]:
+    probabilities = market_probabilities(clob)
+    chain = chainlink.compact()
+    result: dict[str, Any] = {
+        "timestamp": timestamp,
+        "time_remaining": max(0, int(market.window_end - timestamp)),
+        "chainlink": {
+            "raw": chain["raw"],
+            "twap60": chain["twap60"],
+            "raw_from_open_bps": chain["raw_from_open_bps"],
+            "twap_from_open_bps": chain["twap_from_open_bps"],
+        },
+        "market_probabilities": {
+            key: str(value) for key, value in probabilities.items()
+        },
+        "entries": {
+            side: _entry_dict(quote)
+            for side, quote in entries.items()
+        },
+    }
+    books = clob.execution_books()
+    for side, key in (("UP", "up"), ("DOWN", "down")):
+        outcome = clob.up if side == "UP" else clob.down
+        bid_depth = sum((level.size for level in books[side]["bids"][:5]), Decimal("0"))
+        ask_depth = sum((level.size for level in books[side]["asks"][:5]), Decimal("0"))
+        result[key] = {
+            "bid": str(outcome.best_bid),
+            "ask": str(outcome.best_ask),
+            "mid": str(probabilities[f"{key}_mid"]),
+            "depth_bid": str(bid_depth),
+            "depth_ask": str(ask_depth),
+        }
+    return result
+
+
+def evaluate_future_side(
+    entry: ExecutionQuote,
+    bids: list[Level],
+    schedule: FeeSchedule,
+    base_status: str,
+) -> SideFutureResult:
+    if base_status != "valid":
+        return SideFutureResult(base_status, None, None)
+    if not entry.fully_executable:
+        return SideFutureResult("unexecutable", None, None)
+    exit_quote = quote_sell(bids, entry.shares, schedule)
+    if not exit_quote.fully_executable:
+        return SideFutureResult("unexecutable", exit_quote, None)
+    return SideFutureResult(
+        "valid", exit_quote, exit_quote.net_cash - entry.net_cash
+    )
+
+
+def create_pending_labels(
+    decision_id: str,
+    response_epoch: float,
+    response_monotonic: float,
+    response_p_market_up: float,
+    p_jev_up: float,
+    response_entries: Mapping[str, ExecutionQuote],
+) -> list[ForecastPendingLabel]:
+    return [
+        ForecastPendingLabel(
+            decision_id=decision_id,
+            horizon=horizon,
+            target_epoch=response_epoch + horizon,
+            due_monotonic=response_monotonic + horizon,
+            response_p_market_up=response_p_market_up,
+            p_jev_up=p_jev_up,
+            response_entries=response_entries,
+        )
+        for horizon in HORIZONS
+    ]
 
 
 def evaluate_label(
@@ -400,7 +643,8 @@ class ForecastExperiment:
         self.clob: LiveMarketState | None = None
         self.log: JsonlWriter | None = None
         self.scheduler: DecisionScheduler | None = None
-        self.pending: list[PendingLabel] = []
+        self.pending: list[ForecastPendingLabel] = []
+        self.last_signs: dict[str, str] = {}
         self.started_at = datetime.now(timezone.utc)
         self.clob_events = 0
         self.meaningful_clob_updates = 0
@@ -434,6 +678,8 @@ class ForecastExperiment:
             )
             self.log.write(
                 "session_start",
+                experiment_version=2,
+                schema_version=2,
                 started_at=self.started_at.isoformat(),
                 market_slug=market.slug,
                 asset=self.asset,
@@ -518,6 +764,7 @@ class ForecastExperiment:
                                 message = json.loads(raw)
                                 if isinstance(message, Mapping) and self.chainlink.apply(message):
                                     self.state_changed.set()
+                                    self._record_observed_crossovers()
                                     self._submit_latest()
                             except (ValueError, TypeError) as exc:
                                 print(f"RTDS message ignored: {exc}", file=sys.stderr)
@@ -570,6 +817,7 @@ class ForecastExperiment:
                                 if self.clob.trade_ready() and not shown_liquidity:
                                     self._print_liquidity()
                                     shown_liquidity = True
+                                self._record_observed_crossovers()
                                 self._submit_latest()
                     finally:
                         heartbeat.cancel()
@@ -615,24 +863,27 @@ class ForecastExperiment:
         ):
             return
         entries = hypothetical_entries(self.clob, self.market.fee_schedule)
-        model_state = build_compact_state(
-            self.market, self.chainlink, self.clob, entries
-        )
-        questions = build_questions(model_state["market"]["left_s"], entries)
+        model_state = build_compact_state(self.market, self.chainlink, self.clob, entries)
         payload = {
             "jev_state": model_state,
-            "questions": questions,
-            "entries": entries,
-            "captured_epoch": time.time(),
-            "captured_monotonic": time.monotonic(),
-            "liquidity": liquidity_snapshot(
-                self.clob, self.market.fee_schedule, self.market.minimum_tick_size
-            ),
-            "chainlink": self.chainlink.logger_snapshot(),
+            "questions": build_questions(),
         }
         self.scheduler.submit(payload)
 
     async def _decide(self, payload: dict[str, Any]) -> dict[str, Any]:
+        assert self.market is not None and self.clob is not None
+        if not self.clob.trade_ready() or not self.chainlink.ready:
+            raise RuntimeError("input state is not ready")
+        input_epoch = time.time()
+        input_entries = hypothetical_entries(self.clob, self.market.fee_schedule)
+        payload["input_timestamp"] = input_epoch
+        payload["input_entries"] = input_entries
+        payload["input_state"] = capture_realtime_state(
+            self.market, self.chainlink, self.clob, input_entries, input_epoch
+        )
+        payload["jev_state"] = build_compact_state(
+            self.market, self.chainlink, self.clob, input_entries, input_epoch
+        )
         return await call_jev_nouls_async(
             self.client,
             JEV_MODEL,
@@ -650,62 +901,99 @@ class ForecastExperiment:
         started_at: datetime,
         finished_at: datetime,
     ) -> None:
-        assert self.market is not None and self.log is not None
+        assert self.market is not None and self.log is not None and self.clob is not None
         decision_id = str(uuid.uuid4())
         answers = result["probabilities"]
         p_up = answers["resolve_up"]
-        entries: dict[str, ExecutionQuote] = payload["entries"]
-        edges = terminal_edges(p_up, entries)
+        input_entries: dict[str, ExecutionQuote] = payload["input_entries"]
+        input_edges = terminal_edges(p_up, input_entries)
+        response_epoch = time.time()
+        response_monotonic = time.monotonic()
+        response_entries = hypothetical_entries(self.clob, self.market.fee_schedule)
+        response_state = capture_realtime_state(
+            self.market, self.chainlink, self.clob, response_entries, response_epoch
+        )
+        response_market = {
+            key: Decimal(value)
+            for key, value in response_state["market_probabilities"].items()
+        }
+        input_market = {
+            key: Decimal(value)
+            for key, value in payload["input_state"]["market_probabilities"].items()
+        }
+        sides = probability_sides(p_up, response_market["p_market_up"])
+        baselines = chainlink_sides(self.chainlink)
+        actionable_edges = terminal_edges(p_up, response_entries)
+        best_edge = select_best_edge(actionable_edges)
         request_cost = self.cost.record(result.get("input_tokens"))
         self.latencies.append(float(result["latency_ms"]))
-        entries_json = {
-            side: quote.as_dict() for side, quote in entries.items()
-            if quote.fully_executable
-        }
         self.log.write(
             "forecast",
+            experiment_version=2,
+            schema_version=2,
             decision_id=decision_id,
+            input_timestamp=payload["input_timestamp"],
+            response_timestamp=response_epoch,
             decision_started_at=started_at.isoformat(),
             decision_finished_at=finished_at.isoformat(),
             market_slug=self.market.slug,
-            time_remaining=payload["jev_state"]["market"]["left_s"],
+            time_remaining=response_state["time_remaining"],
+            input_state=payload["input_state"],
+            response_state=response_state,
             compact_state_sent_to_jev=payload["jev_state"],
-            clob_liquidity_summary=payload["liquidity"],
-            chainlink_state=payload["chainlink"],
-            question_ids=list(payload["questions"]),
-            answers=answers,
-            p_resolve_up=p_up,
-            p_resolve_down=1 - p_up,
-            up_terminal_break_even=_decimal_or_none(edges["up_terminal_break_even"]),
-            down_terminal_break_even=_decimal_or_none(edges["down_terminal_break_even"]),
-            model_terminal_edge_up=_decimal_or_none(edges["model_terminal_edge_up"]),
-            model_terminal_edge_down=_decimal_or_none(edges["model_terminal_edge_down"]),
-            hypothetical_entries=entries_json,
+            question_ids=["resolve_up"],
+            p_jev_up=p_up,
+            p_jev_down=1 - p_up,
+            input_market_probabilities={
+                key: str(value) for key, value in input_market.items()
+            },
+            response_market_probabilities={
+                key: str(value) for key, value in response_market.items()
+            },
+            probability_delta_up=str(sides["probability_delta_up"]),
+            probability_delta_down=str(sides["probability_delta_down"]),
+            relative_side=sides["relative_side"],
+            raw_side=baselines["raw_side"],
+            twap_side=baselines["twap_side"],
+            jev_side=sides["jev_side"],
+            market_side=sides["market_side"],
+            oracle_entries={side: _entry_dict(quote) for side, quote in input_entries.items()},
+            response_entries={side: _entry_dict(quote) for side, quote in response_entries.items()},
+            oracle_edge_up=_decimal_or_none(input_edges["model_terminal_edge_up"]),
+            oracle_edge_down=_decimal_or_none(input_edges["model_terminal_edge_down"]),
+            actionable_edge_up=_decimal_or_none(
+                actionable_edges["model_terminal_edge_up"]
+            ),
+            actionable_edge_down=_decimal_or_none(
+                actionable_edges["model_terminal_edge_down"]
+            ),
+            terminal_break_even_up=_decimal_or_none(
+                actionable_edges["up_terminal_break_even"]
+            ),
+            terminal_break_even_down=_decimal_or_none(
+                actionable_edges["down_terminal_break_even"]
+            ),
+            best_edge_side=best_edge["best_edge_side"],
+            best_edge_value=_decimal_or_none(best_edge["best_edge_value"]),
+            opposite_edge_value=_decimal_or_none(best_edge["opposite_edge_value"]),
             latency_ms=result["latency_ms"],
             input_tokens=result.get("input_tokens"),
-            estimated_request_cost=str(request_cost),
+            request_cost=str(request_cost),
         )
-        for question_id, probability in answers.items():
-            parsed = _parse_profit_question(question_id)
-            if parsed is None:
-                continue
-            side, horizon = parsed
-            entry = entries[side]
-            self.pending.append(
-                PendingLabel(
-                    decision_id=decision_id,
-                    side=side,
-                    horizon=horizon,
-                    probability=probability,
-                    entry_epoch=payload["captured_epoch"],
-                    target_epoch=payload["captured_epoch"] + horizon,
-                    due_monotonic=payload["captured_monotonic"] + horizon,
-                    entry_quote=entry,
-                )
+        self.pending.extend(
+            create_pending_labels(
+                decision_id,
+                response_epoch,
+                response_monotonic,
+                float(response_market["p_market_up"]),
+                p_up,
+                response_entries,
             )
+        )
+        self._record_crossover("JEV", sides["jev_side"], response_epoch)
         print(
-            f"Forecast left={payload['jev_state']['market']['left_s']}s "
-            f"pUP={p_up:.3f} questions={len(answers)} "
+            f"Forecast left={response_state['time_remaining']}s "
+            f"pUP={p_up:.3f} questions=1 "
             f"tokens={result.get('input_tokens')} latency={result['latency_ms']:.0f}ms"
         )
         if not self.cost.can_request and not self.cost.exhausted_announced:
@@ -732,40 +1020,69 @@ class ForecastExperiment:
         books = self.clob.execution_books()
         now_epoch = time.time()
         for label in due:
-            effective_end = 0 if force_market_end else self.market.window_end
-            result = evaluate_label(
-                label,
-                books[label.side]["bids"],
-                self.market.fee_schedule,
-                now_epoch,
-                now_mono,
-                self.last_clob_update_monotonic,
-                effective_end,
+            delay_ms = max(0.0, (now_epoch - label.target_epoch) * 1000)
+            book_age_ms = (
+                (now_mono - self.last_clob_update_monotonic) * 1000
+                if self.last_clob_update_monotonic > 0
+                else None
             )
-            self.labels_by_horizon[label.horizon] += int(result.status == "valid")
+            if force_market_end or now_epoch >= self.market.window_end:
+                base_status = "market_ended"
+            elif book_age_ms is None or book_age_ms > STALE_BOOK_SEC * 1000:
+                base_status = "stale"
+            elif not self.clob.trade_ready():
+                base_status = "stale"
+            else:
+                base_status = "valid"
+            up_result = evaluate_future_side(
+                label.response_entries["UP"],
+                books["UP"]["bids"],
+                self.market.fee_schedule,
+                base_status,
+            )
+            down_result = evaluate_future_side(
+                label.response_entries["DOWN"],
+                books["DOWN"]["bids"],
+                self.market.fee_schedule,
+                base_status,
+            )
+            future_state = None
+            future_probabilities = None
+            repricing = None
+            if self.clob.trade_ready() and self.chainlink.ready:
+                current_entries = hypothetical_entries(self.clob, self.market.fee_schedule)
+                future_state = capture_realtime_state(
+                    self.market, self.chainlink, self.clob, current_entries, now_epoch
+                )
+                future_probabilities = future_state["market_probabilities"]
+            if base_status == "valid" and future_probabilities is not None:
+                repricing = signed_repricing(
+                    label.p_jev_up,
+                    label.response_p_market_up,
+                    float(future_probabilities["p_market_up"]),
+                )
+            self.labels_by_horizon[label.horizon] += int(base_status == "valid")
             self.log.write(
                 "label",
+                experiment_version=2,
+                schema_version=2,
                 decision_id=label.decision_id,
-                side=label.side,
                 horizon=label.horizon,
-                predicted_probability=label.probability,
-                entry_timestamp=label.entry_epoch,
-                due_timestamp=label.target_epoch,
-                label_timestamp=now_epoch,
-                entry_quote=label.entry_quote.as_dict(),
-                entry_fee=str(label.entry_quote.fee),
-                shares=str(label.entry_quote.shares),
-                exit_quote=(
-                    result.exit_quote.as_dict() if result.exit_quote is not None else None
+                target_timestamp=label.target_epoch,
+                actual_timestamp=now_epoch,
+                future_market_state=future_state,
+                future_p_market_up=(
+                    future_probabilities["p_market_up"] if future_probabilities else None
                 ),
-                exit_fee=(
-                    str(result.exit_quote.fee) if result.exit_quote is not None else None
+                future_p_market_down=(
+                    future_probabilities["p_market_down"] if future_probabilities else None
                 ),
-                actual_net_pnl=_decimal_or_none(result.actual_net_pnl),
-                profitable=result.profitable,
-                label_status=result.status,
-                delay_ms=result.delay_ms,
-                book_age_ms=result.book_age_ms,
+                signed_repricing=repricing,
+                up_response_entry_result=_side_future_dict(up_result),
+                down_response_entry_result=_side_future_dict(down_result),
+                label_status=base_status,
+                book_age_ms=book_age_ms,
+                delay_ms=delay_ms,
             )
 
     async def _wait_for_market_end_and_resolution(self) -> None:
@@ -830,10 +1147,43 @@ class ForecastExperiment:
         if self.liquidity_warning:
             print("WARNING: thin liquidity; this session may be noisier")
 
+    def _record_observed_crossovers(self) -> None:
+        if self.market is None or self.log is None:
+            return
+        timestamp = time.time()
+        if self.chainlink.ready:
+            baselines = chainlink_sides(self.chainlink)
+            self._record_crossover("RAW", baselines["raw_side"], timestamp)
+            self._record_crossover("TWAP", baselines["twap_side"], timestamp)
+        if self.clob is not None and self.clob.trade_ready():
+            market = market_probabilities(self.clob)
+            side = "UP" if market["p_market_up"] >= Decimal("0.5") else "DOWN"
+            self._record_crossover("MARKET", side, timestamp)
+
+    def _record_crossover(self, source: str, side: str, timestamp: float) -> None:
+        if self.market is None or self.log is None:
+            return
+        previous = self.last_signs.get(source)
+        self.last_signs[source] = side
+        if previous is None or previous == side:
+            return
+        self.log.write(
+            "crossover",
+            experiment_version=2,
+            schema_version=2,
+            source=source,
+            timestamp=timestamp,
+            from_side=previous,
+            to_side=side,
+            time_remaining=max(0, int(self.market.window_end - timestamp)),
+        )
+
     def _finish_session(self) -> None:
         assert self.market is not None and self.clob is not None and self.log is not None
         metrics = self.cost.metrics()
         summary = {
+            "experiment_version": 2,
+            "schema_version": 2,
             "market": self.market.slug,
             "winner": self.clob.resolved_winner,
             "settlement_pending": self.resolution_pending,
@@ -857,22 +1207,22 @@ class ForecastExperiment:
         print("\n" + generate_report(self.log.path, resolve_missing=False))
 
 
-def _parse_profit_question(question_id: str) -> tuple[str, int] | None:
-    parts = question_id.split("_")
-    if len(parts) != 3 or parts[1] != "profit" or not parts[2].endswith("s"):
-        return None
-    side = parts[0].upper()
-    try:
-        horizon = int(parts[2][:-1])
-    except ValueError:
-        return None
-    if side not in ("UP", "DOWN") or horizon not in HORIZONS:
-        return None
-    return side, horizon
-
-
 def _decimal_or_none(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
+
+
+def _entry_dict(quote: ExecutionQuote) -> dict[str, Any]:
+    result = quote.as_dict()
+    result["entry_status"] = "valid" if quote.fully_executable else "unexecutable"
+    return result
+
+
+def _side_future_dict(result: SideFutureResult) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "net_pnl": _decimal_or_none(result.net_pnl),
+        "exit_quote": result.exit_quote.as_dict() if result.exit_quote else None,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:

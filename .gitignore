@@ -16,6 +16,7 @@ data/collector_status.json
 data/live_*.jsonl
 data/forecast_*.jsonl
 data/forecast_*_report.csv
+data/forecast_*.zip
 
 .DS_Store
 Thumbs.db

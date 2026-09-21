@@ -123,9 +123,12 @@ target position. Комиссии читаются из текущего рын�
 
 Отдельный realtime-эксперимент не торгует и не управляет позициями. Он строит
 position-independent Jev forecasts по live Polymarket CLOB и Chainlink raw +
-TWAP60 из Polymarket RTDS. Прогнозы на 15/30/60/120 секунд получают точные
-net-profit labels по будущим executable bids с учётом asks и taker fees;
-отдельно оценивается terminal resolution probability и fee-adjusted break-even.
+TWAP60 из Polymarket RTDS. Jev отвечает одним Noul `resolve_up`; DOWN всегда
+вычисляется как бинарное дополнение. Input и post-inference response состояния
+логируются раздельно, а детерминированные 15/30/60/120-секундные labels измеряют
+симметричный market repricing и net PnL обеих сторон по executable bids. Report
+сравнивает Jev с normalized market и Chainlink baselines без trading controller.
+JSONL V2 помечен `experiment_version: 2`; старые forecast JSONL также читаются.
 Лимит расходов Jev по умолчанию — `$0.15` на одну полную рыночную сессию.
 
 ```powershell
